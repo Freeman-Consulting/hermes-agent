@@ -289,6 +289,7 @@ from gateway.restart import (
     GATEWAY_SERVICE_RESTART_EXIT_CODE,
     parse_restart_drain_timeout,
 )
+from gateway.model_picker_state import ModelPickerState
 
 
 def _normalize_whatsapp_identifier(value: str) -> str:
@@ -3238,6 +3239,69 @@ class GatewayRunner:
                 self._pending_messages[_quick_key] = event.text
             return None
 
+        # ---- Pending-picker intercept (before command dispatch) ----
+        # If this chat has a pending /model picker and the user sent a number
+        # (or "more"), route it to the picker callback.  If they sent any
+        # /command, cancel the pending picker cleanly.  Any other text falls
+        # through to normal agent handling.
+        adapter = self.adapters.get(source.platform)
+        picker_state = getattr(adapter, "_model_picker_state", None) if adapter else None
+        if picker_state is not None:
+            platform_str = source.platform.value if source.platform else ""
+            chat_id_str = str(source.chat_id)
+            session_entry = self.session_store.get_or_create_session(source)
+            sess_key = session_entry.session_key
+
+            # Check for expired picker before normal lookup
+            expired = picker_state.check_expired(platform_str, chat_id_str, sess_key)
+            raw_text = (event.text or "").strip()
+
+            if expired is not None and raw_text.isdigit():
+                # User replied with a number after TTL expired
+                return "Picker expired — run `/model` again to pick a new model."
+
+            pending = picker_state.lookup(platform_str, chat_id_str, sess_key)
+            if pending is not None:
+                # User sent a slash command → cancel pending state, let dispatch continue
+                if raw_text.startswith("/"):
+                    picker_state.cancel(platform_str, chat_id_str, sess_key)
+                    # fall through to normal command dispatch below
+
+                # Bare number reply → resolve and invoke callback
+                elif raw_text.isdigit():
+                    one_indexed = int(raw_text)
+                    # resolve_model_index is 0-indexed; UI is 1-indexed
+                    resolved = ModelPickerState.resolve_model_index(
+                        pending.providers, one_indexed - 1
+                    )
+                    if resolved is None:
+                        total = sum(len(p.get("models", [])) for p in pending.providers)
+                        return f"Number out of range. Reply 1–{total} or 'more'."
+                    model_id, provider_name = resolved
+                    # Invoke callback (async)
+                    try:
+                        result_text = await pending.on_model_selected(
+                            chat_id_str, model_id, provider_name
+                        )
+                    except Exception as e:
+                        logger.exception("Model picker callback failed")
+                        picker_state.cancel(platform_str, chat_id_str, sess_key)
+                        return f"Failed to switch model: {e}"
+                    # Clear pending state after successful switch
+                    picker_state.cancel(platform_str, chat_id_str, sess_key)
+                    return result_text or f"Switched to {model_id} ({provider_name})."
+
+                # "more" reply → re-send picker with next page
+                elif raw_text.lower() == "more":
+                    return await self._handle_picker_more(
+                        adapter, pending, platform_str, chat_id_str, sess_key
+                    )
+
+                # Anything else (e.g. free-form agent query) → expire picker, fall through
+                else:
+                    picker_state.cancel(platform_str, chat_id_str, sess_key)
+                    # fall through to normal handling
+
         # Check for commands
         command = event.get_command()
         
@@ -5398,6 +5462,51 @@ class GatewayRunner:
             lines.append("_(session only -- add `--global` to persist)_")
 
         return "\n".join(lines)
+
+    async def _handle_picker_more(
+        self,
+        adapter: BasePlatformAdapter,
+        pending: Any,
+        platform_str: str,
+        chat_id_str: str,
+        sess_key: str,
+    ) -> Optional[str]:
+        """Handle 'more' reply: re-send picker with next page.
+
+        Increments the current_page on the entry and calls send_model_picker
+        with the new page index.  Wraps around to page 0 if past the end.
+        """
+        picker_state: ModelPickerState = adapter._model_picker_state
+        pagination = ModelPickerState.paginate_models(pending.providers, page=0)
+        total_pages = pagination["total_pages"]
+
+        # Compute next page; wrap around if past the end
+        new_page = (pending.current_page + 1) % total_pages
+
+        # Update the entry's current_page in-place (via direct store access)
+        key: tuple = (platform_str, chat_id_str, sess_key)
+        if key in picker_state._store:
+            picker_state._store[key].current_page = new_page
+
+        # Re-send with the new page
+        metadata = {
+            "thread_id": adapter._last_source.thread_id
+        } if getattr(adapter, "_last_source", None) and getattr(adapter._last_source, "thread_id", None) else None
+
+        result = await adapter.send_model_picker(
+            chat_id=chat_id_str,
+            providers=pending.providers,
+            current_model=pending.current_model,
+            current_provider=pending.current_provider,
+            session_key=sess_key,
+            on_model_selected=pending.on_model_selected,
+            metadata=metadata,
+            page=new_page,
+        )
+
+        if not result.success:
+            return f"Failed to re-send picker: {result.error}"
+        return None  # Picker sent; adapter handles the response
 
     async def _handle_provider_command(self, event: MessageEvent) -> str:
         """Handle /provider command - show available providers."""

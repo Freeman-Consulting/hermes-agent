@@ -914,11 +914,22 @@ class SignalAdapter(BasePlatformAdapter):
         session_key: str,
         on_model_selected,
         metadata: Optional[Dict[str, Any]] = None,
+        page: int = 0,
     ) -> SendResult:
         """Send a numbered model picker via Signal.
 
-        Users reply with a number (1-indexed) to pick a model, or \"more\"
+        Users reply with a number (1-indexed) to pick a model, or "more"
         for the next page.  Picker expires after PICKER_TTL_SECONDS.
+
+        Args:
+            chat_id: Recipient chat identifier.
+            providers: List of provider dicts with model lists.
+            current_model: The user's currently active model.
+            current_provider: The user's currently active provider slug.
+            session_key: Hermes session key for state tracking.
+            on_model_selected: Callback invoked on model selection.
+            metadata: Optional extra metadata (e.g. thread_id).
+            page: Page index to render (0-based, default 0).
         """
         if not self.client:
             return SendResult(success=False, error="Signal not connected")
@@ -942,22 +953,24 @@ class SignalAdapter(BasePlatformAdapter):
             return SendResult(success=result is not None)
 
         # Build the picker message (1-indexed display)
-        pagination = ModelPickerState.paginate_models(providers, page=0)
+        pagination = ModelPickerState.paginate_models(providers, page=page)
         lines = [
-            f"⚙ Select a model (page 1/{pagination['total_pages']})",
+            f"⚙ Select a model (page {page + 1}/{pagination['total_pages']})",
             "",
             f"Current: {current_model or 'unknown'} ({current_provider})",
             "",
         ]
-        for idx, (_, model_id, provider_name) in enumerate(pagination["models"]):
+        for flat_idx, model_id, provider_name in pagination["models"]:
             short = model_id.split("/")[-1] if "/" in model_id else model_id
             if len(short) > 40:
                 short = short[:37] + "..."
-            lines.append(f"  {idx + 1}. {short} ({provider_name})")
+            lines.append(f"  {flat_idx + 1}. {short} ({provider_name})")
 
         lines.append("")
         if pagination["total_pages"] > 1:
-            lines.append("Reply with a number to select, or \"more\" for next page.")
+            first = pagination["models"][0][0] + 1
+            last = pagination["models"][-1][0] + 1
+            lines.append(f"Reply with a number ({first}–{last}) to select, or \"more\" for next page.")
         else:
             lines.append("Reply with a number to select.")
 
@@ -973,7 +986,7 @@ class SignalAdapter(BasePlatformAdapter):
         if result is None:
             return SendResult(success=False, error="Failed to send picker")
 
-        # Register pending picker state
+         # Register pending picker state
         self._model_picker_state.add(
             platform="signal",
             chat_id=chat_id,
@@ -982,6 +995,7 @@ class SignalAdapter(BasePlatformAdapter):
             current_model=current_model,
             current_provider=current_provider,
             on_model_selected=on_model_selected,
+            current_page=page,
         )
 
         return SendResult(success=True)

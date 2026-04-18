@@ -52,6 +52,8 @@ class _PickerEntry:
     """API key for the current provider."""
     created_at: float = field(default_factory=time.monotonic)
     """Monotonic timestamp when this picker was created."""
+    current_page: int = 0
+    """Current page index (0-based) for pagination. Updated on 'more' replies."""
 
     def is_expired(self) -> bool:
         """Return True if this entry has exceeded PICKER_TTL_SECONDS."""
@@ -89,6 +91,7 @@ class ModelPickerState:
         current_base_url: Optional[str] = None,
         current_api_key: Optional[str] = None,
         on_model_selected: Optional[Callable] = None,
+        current_page: int = 0,
     ) -> _PickerKey:
         """Register a new pending picker.
 
@@ -108,6 +111,7 @@ class ModelPickerState:
                 if on_model_selected is not None
                 else self._default_callback
             ),
+            current_page=current_page,
         )
         return key
 
@@ -147,6 +151,21 @@ class ModelPickerState:
     ) -> bool:
         """Return True if a non-expired picker exists for this triple."""
         return self.lookup(platform, chat_id, session_key) is not None
+
+    # -- Expiry detection ---------------------------------------------------
+
+    def check_expired(
+        self, platform: str, chat_id: str, session_key: str
+    ) -> Optional[_PickerEntry]:
+        """Return the entry if it exists AND is expired. Otherwise None. Evicts."""
+        key: _PickerKey = (platform, chat_id, session_key)
+        entry = self._store.get(key)
+        if entry is None:
+            return None
+        if entry.is_expired():
+            del self._store[key]
+            return entry
+        return None
 
     # -- Pagination helpers -------------------------------------------------
 

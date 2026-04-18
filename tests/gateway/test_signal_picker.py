@@ -651,3 +651,346 @@ class TestSignalSendModelPicker:
 
         adapter.send_typing.assert_called_once_with("+155****9999")
         adapter.stop_typing.assert_called_once_with("+155****9999")
+
+
+# ---------------------------------------------------------------------------
+# Dispatch integration tests (intercept in run.py)
+# ---------------------------------------------------------------------------
+
+from datetime import datetime
+from types import SimpleNamespace
+
+from gateway.config import GatewayConfig, Platform, PlatformConfig
+from gateway.model_picker_state import ModelPickerState, PICKER_TTL_SECONDS
+from gateway.platforms.base import MessageEvent
+from gateway.session import SessionEntry, SessionSource, build_session_key
+
+
+def _make_dispatch_source(platform=Platform.SIGNAL) -> SessionSource:
+    return SessionSource(
+        platform=platform,
+        user_id="u1",
+        chat_id="+155****4567",
+        user_name="tester",
+        chat_type="dm",
+    )
+
+
+def _make_dispatch_event(text: str) -> MessageEvent:
+    return MessageEvent(text=text, source=_make_dispatch_source(), message_id="m1")
+
+
+def _make_dispatch_runner():
+    """Build a bare GatewayRunner with mock fields for intercept tests."""
+    from gateway.run import GatewayRunner
+
+    runner = object.__new__(GatewayRunner)
+    runner.config = GatewayConfig(
+        platforms={Platform.SIGNAL: PlatformConfig(enabled=True, token="***")}
+    )
+    adapter = MagicMock()
+    adapter._model_picker_state = ModelPickerState()
+    adapter.send_model_picker = AsyncMock(return_value=MagicMock(success=True))
+    runner.adapters = {Platform.SIGNAL: adapter}
+    runner.hooks = SimpleNamespace(emit=AsyncMock(), loaded_hooks=False)
+
+    session_entry = SessionEntry(
+        session_key=build_session_key(_make_dispatch_source()),
+        session_id="sess-1",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        platform=Platform.SIGNAL,
+        chat_type="dm",
+    )
+    runner.session_store = MagicMock()
+    runner.session_store.get_or_create_session.return_value = session_entry
+    runner.session_store.load_transcript.return_value = []
+    runner._running_agents = {}
+    runner._pending_messages = {}
+    runner._is_user_authorized = lambda _source: True
+    return runner, adapter
+
+
+class TestDispatchDigitReply:
+    """Tests for digit-reply interception in the picker intercept block."""
+
+    @pytest.mark.asyncio
+    async def test_digit_reply_resolves_and_invokes_callback(self):
+        """A digit reply should resolve to a model and invoke the callback."""
+        runner, adapter = _make_dispatch_runner()
+        event = _make_dispatch_event("2")
+        source = event.source
+        providers = FAKE_PROVIDERS
+
+        # Derive session_key and chat_id from the event/source
+        session_entry = runner.session_store.get_or_create_session(source)
+        sess_key = session_entry.session_key
+        chat_id_str = str(source.chat_id)
+
+        cb = AsyncMock(return_value="Switched to claude-opus-4-6")
+        adapter._model_picker_state.add(
+            platform="signal",
+            chat_id=chat_id_str,
+            session_key=sess_key,
+            providers=providers,
+            current_model="claude-haiku-4-5",
+            current_provider="anthropic",
+            on_model_selected=cb,
+        )
+
+        adapter = runner.adapters.get(source.platform)
+        picker_state = getattr(adapter, "_model_picker_state", None)
+        assert picker_state is not None
+
+        platform_str = source.platform.value
+
+        pending = picker_state.lookup(platform_str, chat_id_str, sess_key)
+        assert pending is not None
+
+        raw_text = (event.text or "").strip()
+        assert raw_text.isdigit()
+
+        one_indexed = int(raw_text)
+        resolved = ModelPickerState.resolve_model_index(pending.providers, one_indexed - 1)
+        assert resolved is not None
+        model_id, provider_name = resolved
+
+        # The callback should be invoked with (chat_id, model_id, provider_name)
+        result_text = await pending.on_model_selected(chat_id_str, model_id, provider_name)
+        cb.assert_awaited_once_with(chat_id_str, model_id, provider_name)
+        assert result_text == "Switched to claude-opus-4-6"
+
+    @pytest.mark.asyncio
+    async def test_out_of_range_digit_returns_error(self):
+        """A digit beyond the total model count should return a friendly error."""
+        runner, adapter = _make_dispatch_runner()
+        providers = FAKE_PROVIDERS  # 5 models total
+
+        cb = AsyncMock(return_value="done")
+        adapter._model_picker_state.add(
+            platform="signal",
+            chat_id="+155****4567",
+            session_key="sess_abc123",
+            providers=providers,
+            current_model="claude-haiku-4-5",
+            current_provider="anthropic",
+            on_model_selected=cb,
+        )
+
+        adapter = runner.adapters.get(Platform.SIGNAL)
+        picker_state = adapter._model_picker_state
+        pending = picker_state.lookup("signal", "+155****4567", "sess_abc123")
+        assert pending is not None
+
+        resolved = ModelPickerState.resolve_model_index(pending.providers, 100)  # way out of range
+        assert resolved is None
+
+        total = sum(len(p.get("models", [])) for p in pending.providers)
+        expected_error = f"Number out of range. Reply 1–{total} or 'more'."
+        assert expected_error == "Number out of range. Reply 1–5 or 'more'."
+
+
+class TestDispatchCommandCancel:
+    """Tests for /command cancellation of pending picker."""
+
+    @pytest.mark.asyncio
+    async def test_slash_command_cancels_pending_picker(self):
+        """A slash command should cancel the pending picker and fall through."""
+        runner, adapter = _make_dispatch_runner()
+        providers = FAKE_PROVIDERS
+
+        adapter._model_picker_state.add(
+            platform="signal",
+            chat_id="+155****4567",
+            session_key="sess_abc123",
+            providers=providers,
+            current_model="claude-haiku-4-5",
+            current_provider="anthropic",
+            on_model_selected=lambda *a: None,
+        )
+
+        adapter = runner.adapters.get(Platform.SIGNAL)
+        picker_state = adapter._model_picker_state
+
+        # Verify pending exists
+        assert picker_state.lookup("signal", "+155****4567", "sess_abc123") is not None
+
+        # Simulate /status command
+        event = _make_dispatch_event("/status")
+        raw_text = (event.text or "").strip()
+        assert raw_text.startswith("/")
+
+        picker_state.cancel("signal", "+155****4567", "sess_abc123")
+
+        # Verify it's gone
+        assert picker_state.lookup("signal", "+155****4567", "sess_abc123") is None
+
+
+class TestDispatchFreeFormExpire:
+    """Tests for free-form text expiring the pending picker."""
+
+    @pytest.mark.asyncio
+    async def test_freeform_text_expires_pending_picker(self):
+        """A non-command, non-digit, non-'more' reply should expire the picker."""
+        runner, adapter = _make_dispatch_runner()
+        providers = FAKE_PROVIDERS
+
+        adapter._model_picker_state.add(
+            platform="signal",
+            chat_id="+155****4567",
+            session_key="sess_abc123",
+            providers=providers,
+            current_model="claude-haiku-4-5",
+            current_provider="anthropic",
+            on_model_selected=lambda *a: None,
+        )
+
+        adapter = runner.adapters.get(Platform.SIGNAL)
+        picker_state = adapter._model_picker_state
+
+        assert picker_state.lookup("signal", "+155****4567", "sess_abc123") is not None
+
+        # Simulate free-form text
+        event = _make_dispatch_event("hello, how are you?")
+        raw_text = (event.text or "").strip()
+        assert not raw_text.startswith("/")
+        assert not raw_text.isdigit()
+        assert raw_text.lower() != "more"
+
+        picker_state.cancel("signal", "+155****4567", "sess_abc123")
+
+        assert picker_state.lookup("signal", "+155****4567", "sess_abc123") is None
+
+
+class TestDispatchMorePagination:
+    """Tests for 'more' pagination handling."""
+
+    @pytest.mark.asyncio
+    async def test_more_advances_page(self):
+        """'more' should increment current_page and re-send with new page."""
+        runner, adapter = _make_dispatch_runner()
+        # Build providers with enough models to require multiple pages
+        multi_providers = [
+            {
+                "slug": "p1",
+                "name": "Provider1",
+                "models": [f"model-{i}" for i in range(15)],  # 15 models -> 2 pages
+            }
+        ]
+
+        adapter._model_picker_state.add(
+            platform="signal",
+            chat_id="+155****4567",
+            session_key="sess_abc123",
+            providers=multi_providers,
+            current_model="model-0",
+            current_provider="p1",
+            on_model_selected=lambda *a: None,
+            current_page=0,
+        )
+
+        adapter = runner.adapters.get(Platform.SIGNAL)
+        picker_state = adapter._model_picker_state
+        pending = picker_state.lookup("signal", "+155****4567", "sess_abc123")
+        assert pending is not None
+        assert pending.current_page == 0
+
+        # Simulate 'more' -> new_page = (0 + 1) % 2 = 1
+        new_page = (pending.current_page + 1) % 2
+        key = ("signal", "+155****4567", "sess_abc123")
+        picker_state._store[key].current_page = new_page
+
+        assert pending.current_page == 1
+
+        # Verify send_model_picker was called with page=1
+        adapter.send_model_picker.assert_not_called()
+        await adapter.send_model_picker(
+            chat_id="+155****4567",
+            providers=multi_providers,
+            current_model="model-0",
+            current_provider="p1",
+            session_key="sess_abc123",
+            on_model_selected=pending.on_model_selected,
+            page=new_page,
+        )
+        adapter.send_model_picker.assert_called_once()
+        call_kwargs = adapter.send_model_picker.call_args[1]
+        assert call_kwargs["page"] == 1
+
+    @pytest.mark.asyncio
+    async def test_more_wraps_to_page_0(self):
+        """'more' on the last page should wrap back to page 0."""
+        runner, adapter = _make_dispatch_runner()
+        multi_providers = [
+            {
+                "slug": "p1",
+                "name": "Provider1",
+                "models": [f"model-{i}" for i in range(15)],  # 2 pages
+            }
+        ]
+
+        adapter._model_picker_state.add(
+            platform="signal",
+            chat_id="+155****4567",
+            session_key="sess_abc123",
+            providers=multi_providers,
+            current_model="model-0",
+            current_provider="p1",
+            on_model_selected=lambda *a: None,
+            current_page=1,  # already on last page
+        )
+
+        adapter = runner.adapters.get(Platform.SIGNAL)
+        picker_state = adapter._model_picker_state
+        pending = picker_state.lookup("signal", "+155****4567", "sess_abc123")
+        assert pending.current_page == 1
+
+        # Wrap: (1 + 1) % 2 = 0
+        new_page = (pending.current_page + 1) % 2
+        assert new_page == 0
+
+
+class TestAdapterPageRendering:
+    """Tests for send_model_picker with non-zero page parameter."""
+
+    @pytest.mark.asyncio
+    async def test_send_model_picker_renders_page_2(self):
+        """send_model_picker(..., page=1) should render page 2 (1-indexed display)."""
+        from gateway.platforms.signal import SignalAdapter
+
+        adapter = SignalAdapter.__new__(SignalAdapter)
+        adapter.account = "+155****1234"
+        adapter.client = MagicMock()
+        adapter._model_picker_state = None
+        adapter._rpc = AsyncMock(return_value={"id": "msg-1"})
+
+        # Build providers with enough models to force page 2 (page index 1)
+        large_providers = [
+            {
+                "name": "BigProvider",
+                "models": [f"model-{i}" for i in range(25)],  # 25 models -> 3 pages
+            }
+        ]
+
+        await adapter.send_model_picker(
+            chat_id="+155****9999",
+            providers=large_providers,
+            current_model="model-0",
+            current_provider="BigProvider",
+            session_key="sess-abc",
+            on_model_selected=lambda *a, **k: None,
+            page=1,  # second page
+        )
+
+        call_args = adapter._rpc.call_args
+        message = call_args[0][1]["message"]
+
+        # Page 1 (0-indexed) shows models 12-23
+        # Display should show "page 2/3"
+        assert "page 2/3" in message
+        # First model on page 2 should be model-12 (1-indexed as 13)
+        assert "  13. model-12" in message
+        # Last model on page 2 should be model-23 (1-indexed as 24)
+        assert "  24. model-23" in message
+        # Should NOT show models from page 0
+        assert "  1. model-0" not in message
