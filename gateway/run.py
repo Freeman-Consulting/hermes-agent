@@ -25,10 +25,11 @@ import tempfile
 import threading
 import time
 from collections import OrderedDict
+from contextlib import asynccontextmanager
 from contextvars import copy_context
 from pathlib import Path
 from datetime import datetime
-from typing import Dict, Optional, Any, List
+from typing import AsyncContextManager, Dict, Optional, Any, List
 
 # --- Agent cache tuning ---------------------------------------------------
 # Bounds the per-session AIAgent cache to prevent unbounded growth in
@@ -557,6 +558,72 @@ def _format_gateway_process_notification(evt: dict) -> "str | None":
         text += "]"
         return text
 
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Runtime helpers used by command dispatch
+# ---------------------------------------------------------------------------
+
+
+@asynccontextmanager
+async def typing_during_command(adapter, chat_id: str):
+    """Context manager that sends typing indicator while a command runs.
+
+    Calls ``adapter.send_typing(chat_id)`` on enter and
+    ``adapter.stop_typing(chat_id)`` on exit, using duck-typing via
+    ``getattr()`` so adapters without typing support are no-ops.
+
+    Exceptions from send/stop are suppressed — a failed typing indicator
+    must never kill the command handler.
+    """
+    send_fn = getattr(adapter, "send_typing", None)
+    stop_fn = getattr(adapter, "stop_typing", None)
+
+    try:
+        if send_fn is not None:
+            await send_fn(chat_id)
+    except Exception:
+        pass  # best-effort typing
+
+    try:
+        yield
+    finally:
+        try:
+            if stop_fn is not None:
+                await stop_fn(chat_id)
+        except Exception:
+            pass  # best-effort stop
+
+
+def suggest_command(user_input: str, threshold: float = 0.6) -> Optional[str]:
+    """Return a suggested command for a typo'd user input.
+
+    Strips a leading ``/`` from *user_input* before matching against
+    ``GATEWAY_KNOWN_COMMANDS``.  Returns the best match with ``/``
+    prepended, or ``None`` if no match exceeds *threshold*.
+
+    Examples:
+        >>> suggest_command("/modle")
+        '/model'
+        >>> suggest_command("xyzzy")
+        None
+        >>> suggest_command("/help")
+        '/help'
+    """
+    import difflib
+    from hermes_cli.commands import GATEWAY_KNOWN_COMMANDS
+
+    raw = user_input.strip()
+    if not raw:
+        return None
+
+    needle = raw.lstrip("/")
+    matches = difflib.get_close_matches(
+        needle, GATEWAY_KNOWN_COMMANDS, n=1, cutoff=threshold
+    )
+    if matches:
+        return "/" + matches[0]
     return None
 
 

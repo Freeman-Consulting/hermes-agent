@@ -4,10 +4,12 @@ Tests cover: add/lookup, TTL expiry, cancel/expiry, pagination helpers,
 and index resolution.  No adapter or gateway runner is involved.
 """
 
+import asyncio
 import time
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+import pytest_asyncio
 
 from gateway.model_picker_state import (
     PAGE_SIZE,
@@ -280,3 +282,140 @@ class TestDefaultCallback:
     def test_default_callback_returns_string(self):
         result = ModelPickerState._default_callback("+123", "model-x", "provider-y")
         assert result == "Selected model-x (provider-y)"
+
+
+# ---------------------------------------------------------------------------
+# Typing indicator context manager (run.py)
+# ---------------------------------------------------------------------------
+
+
+class TestTypingDuringCommand:
+    """Tests for ``typing_during_command`` async context manager."""
+
+    @pytest_asyncio.fixture
+    async def adapter_with_typing(self):
+        """Adapter that exposes send_typing and stop_typing."""
+        adapter = MagicMock(spec_set=["send_typing", "stop_typing"])
+        adapter.send_typing = AsyncMock()
+        adapter.stop_typing = AsyncMock()
+        return adapter
+
+    @pytest_asyncio.fixture
+    async def adapter_without_typing(self):
+        """Adapter with no typing methods at all."""
+        adapter = MagicMock(spec_set=[])
+        return adapter
+
+    @pytest_asyncio.fixture
+    async def adapter_with_partial_typing(self):
+        """Adapter that has send_typing but not stop_typing."""
+        adapter = MagicMock(spec_set=["send_typing"])
+        adapter.send_typing = AsyncMock()
+        return adapter
+
+    @pytest.mark.asyncio
+    async def test_calls_send_and_stop(self, adapter_with_typing):
+        cm = self._import_cm()(adapter_with_typing, "+123")
+        async with cm:
+            pass
+        adapter_with_typing.send_typing.assert_called_once_with("+123")
+        adapter_with_typing.stop_typing.assert_called_once_with("+123")
+
+    @pytest.mark.asyncio
+    async def test_noop_when_no_typing_methods(self, adapter_without_typing):
+        """No crash when adapter has no send/stop typing."""
+        cm = self._import_cm()(adapter_without_typing, "+123")
+        async with cm:
+            pass  # should not raise
+
+    @pytest.mark.asyncio
+    async def test_noop_when_only_send_typing(self, adapter_with_partial_typing):
+        """No crash when adapter has send_typing but no stop_typing."""
+        cm = self._import_cm()(adapter_with_partial_typing, "+123")
+        async with cm:
+            pass
+        adapter_with_partial_typing.send_typing.assert_called_once_with("+123")
+
+    @pytest.mark.asyncio
+    async def test_send_typing_exception_suppressed(self):
+        """A failing send_typing does not kill the command."""
+        adapter = MagicMock(spec_set=["send_typing", "stop_typing"])
+        adapter.send_typing = AsyncMock(side_effect=RuntimeError("oops"))
+        adapter.stop_typing = AsyncMock()
+
+        cm = self._import_cm()(adapter, "+123")
+        async with cm:
+            pass  # should not raise
+
+    @pytest.mark.asyncio
+    async def test_stop_typing_exception_suppressed(self):
+        """A failing stop_typing does not kill the command."""
+        adapter = MagicMock(spec_set=["send_typing", "stop_typing"])
+        adapter.send_typing = AsyncMock()
+        adapter.stop_typing = AsyncMock(side_effect=RuntimeError("oops"))
+
+        cm = self._import_cm()(adapter, "+123")
+        async with cm:
+            pass  # should not raise
+
+    @staticmethod
+    def _import_cm():
+        """Lazy import to avoid importing run.py at module load time."""
+        from gateway.run import typing_during_command
+        return typing_during_command
+
+
+# ---------------------------------------------------------------------------
+# Fuzzy command suggestion helper (run.py)
+# ---------------------------------------------------------------------------
+
+
+class TestSuggestCommand:
+    """Tests for ``suggest_command`` fuzzy matching helper."""
+
+    @staticmethod
+    def _import_fn():
+        from gateway.run import suggest_command
+        return suggest_command
+
+    def test_typo_suggests_model(self):
+        fn = self._import_fn()
+        result = fn("/modle")
+        assert result == "/model"
+
+    def test_typo_suggests_help(self):
+        fn = self._import_fn()
+        result = fn("/hlep")
+        # "hlep" is close enough to "help" with default threshold
+        assert result == "/help"
+
+    def test_garbage_returns_none(self):
+        fn = self._import_fn()
+        result = fn("xyzzyfoobar")
+        assert result is None
+
+    def test_correct_command_returns_itself(self):
+        fn = self._import_fn()
+        result = fn("/help")
+        assert result == "/help"
+
+    def test_empty_string_returns_none(self):
+        fn = self._import_fn()
+        assert fn("") is None
+
+    def test_whitespace_only_returns_none(self):
+        fn = self._import_fn()
+        assert fn("   ") is None
+
+    def test_no_slash_prefix_still_matches(self):
+        fn = self._import_fn()
+        result = fn("modle")
+        assert result == "/model"
+
+    def test_high_threshold_stricter(self):
+        fn = self._import_fn()
+        # With a very high threshold, "modle" might not match "model"
+        result = fn("/modle", threshold=0.95)
+        # difflib.get_close_matches cutoff=0.95 — "modle" vs "model"
+        # ratio ≈ 0.8, so this should return None
+        assert result is None
