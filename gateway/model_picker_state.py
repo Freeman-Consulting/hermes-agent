@@ -219,14 +219,18 @@ class ModelPickerState:
         (meaning the 3rd model on that page) resolves to flat index 14
         (12 + 2).
 
-        Returns ``(model_id, provider_name)`` or ``None`` if index is out
+        Returns ``(model_id, provider_slug)`` or ``None`` if index is out
         of range.
+
+        .. note:: Returns the **slug** (not display name) because callers
+           pass this to ``_switch_model(explicit_provider=...)`` which
+           requires a config-level provider slug.
         """
         flat: list[tuple[str, str]] = []
         for prov in providers:
-            pname = prov.get("name", prov.get("slug", "unknown"))
+            slug = prov.get("slug", prov.get("name", "unknown"))
             for mid in prov.get("models", []):
-                flat.append((mid, pname))
+                flat.append((mid, slug))
         if 0 <= index < len(flat):
             return flat[index]
         return None

@@ -3277,11 +3277,11 @@ class GatewayRunner:
                     if resolved is None:
                         total = sum(len(p.get("models", [])) for p in pending.providers)
                         return f"Number out of range. Reply 1–{total} or 'more'."
-                    model_id, provider_name = resolved
+                    model_id, provider_slug = resolved
                     # Invoke callback (async)
                     try:
                         result_text = await pending.on_model_selected(
-                            chat_id_str, model_id, provider_name
+                            chat_id_str, model_id, provider_slug
                         )
                     except Exception as e:
                         logger.exception("Model picker callback failed")
@@ -3289,7 +3289,7 @@ class GatewayRunner:
                         return f"Failed to switch model: {e}"
                     # Clear pending state after successful switch
                     picker_state.cancel(platform_str, chat_id_str, sess_key)
-                    return result_text or f"Switched to {model_id} ({provider_name})."
+                    return result_text or f"Switched to {model_id}."
 
                 # "more" reply → re-send picker with next page
                 elif raw_text.lower() == "more":

@@ -219,14 +219,14 @@ class TestPagination:
 
 class TestResolveModelIndex:
     def test_resolve_valid_index(self):
-        model_id, provider_name = ModelPickerState.resolve_model_index(FAKE_PROVIDERS, 0)
+        model_id, provider_slug = ModelPickerState.resolve_model_index(FAKE_PROVIDERS, 0)
         assert model_id == "claude-opus-4-6"
-        assert provider_name == "Anthropic"
+        assert provider_slug == "anthropic"
 
     def test_resolve_last_index(self):
-        model_id, provider_name = ModelPickerState.resolve_model_index(FAKE_PROVIDERS, 4)
+        model_id, provider_slug = ModelPickerState.resolve_model_index(FAKE_PROVIDERS, 4)
         assert model_id == "o3-pro"
-        assert provider_name == "OpenAI"
+        assert provider_slug == "openai"
 
     def test_resolve_out_of_range_returns_none(self):
         assert ModelPickerState.resolve_model_index(FAKE_PROVIDERS, 5) is None
@@ -262,9 +262,9 @@ class TestResolveModelIndex:
         # Total 45 models, last index is 44
         result = ModelPickerState.resolve_model_index(big_providers, 44)
         assert result is not None
-        model_id, provider_name = result
+        model_id, provider_slug = result
         assert model_id == "m-2-14"
-        assert provider_name == "Provider 2"
+        assert provider_slug == "p2"
 
     def test_resolve_model_index_boundary_zero(self):
         """Index 0 should work (not just positive indices)."""
@@ -753,11 +753,11 @@ class TestDispatchDigitReply:
         one_indexed = int(raw_text)
         resolved = ModelPickerState.resolve_model_index(pending.providers, one_indexed - 1)
         assert resolved is not None
-        model_id, provider_name = resolved
+        model_id, provider_slug = resolved
 
-        # The callback should be invoked with (chat_id, model_id, provider_name)
-        result_text = await pending.on_model_selected(chat_id_str, model_id, provider_name)
-        cb.assert_awaited_once_with(chat_id_str, model_id, provider_name)
+        # The callback should be invoked with (chat_id, model_id, provider_slug)
+        result_text = await pending.on_model_selected(chat_id_str, model_id, provider_slug)
+        cb.assert_awaited_once_with(chat_id_str, model_id, provider_slug)
         assert result_text == "Switched to claude-opus-4-6"
 
     @pytest.mark.asyncio
@@ -1087,15 +1087,15 @@ class TestSignalPickerIntegration:
         one_indexed = int(raw_text)
         resolved = ModelPickerState.resolve_model_index(pending.providers, one_indexed - 1)
         assert resolved is not None
-        model_id, provider_name = resolved
+        model_id, provider_slug = resolved
 
         # The 3rd model (flat index 2) should be 'claude-haiku-4-5' from anthropic
         assert model_id == "claude-haiku-4-5"
-        assert provider_name == "Anthropic"
+        assert provider_slug == "anthropic"
 
         # Invoke the callback as the dispatch intercept block would
-        result_text = await pending.on_model_selected(chat_id_str, model_id, provider_name)
-        cb.assert_awaited_once_with(chat_id_str, model_id, provider_name)
+        result_text = await pending.on_model_selected(chat_id_str, model_id, provider_slug)
+        cb.assert_awaited_once_with(chat_id_str, model_id, provider_slug)
         assert result_text == "Switched to claude-sonnet-4-5"
 
         # Dispatch intercept block cancels state after callback fires
