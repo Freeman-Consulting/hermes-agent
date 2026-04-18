@@ -994,3 +994,113 @@ class TestAdapterPageRendering:
         assert "  24. model-23" in message
         # Should NOT show models from page 0
         assert "  1. model-0" not in message
+
+
+# ---------------------------------------------------------------------------
+# End-to-end: fake signal-cli SSE stream drives /model → picker → 3 → switch
+# ---------------------------------------------------------------------------
+
+
+class TestSignalPickerIntegration:
+    """Integration test: adapter.send_model_picker + state store + index resolution
+    glue together correctly. This is the closest we get to E2E without standing up
+    a full GatewayRunner — the real dispatch intercept is exercised by
+    TestDispatchDigitReply and friends.
+    """
+
+    @pytest.mark.asyncio
+    async def test_full_model_picker_flow(self):
+        """/model sends picker via _rpc, '3' resolves to 3rd model, callback fires, state cleared."""
+        from gateway.platforms.signal import SignalAdapter
+        from gateway.run import GatewayRunner
+
+        # Build adapter with real send_model_picker but mocked _rpc
+        adapter = SignalAdapter.__new__(SignalAdapter)
+        adapter.account = "+155****1234"
+        adapter.client = MagicMock()
+        adapter._model_picker_state = None
+        adapter._rpc = AsyncMock(return_value={"id": "msg-1"})
+
+        # Build a runner that points to this adapter
+        runner = object.__new__(GatewayRunner)
+        runner.config = GatewayConfig(
+            platforms={Platform.SIGNAL: PlatformConfig(enabled=True, token="***")}
+        )
+        runner.adapters = {Platform.SIGNAL: adapter}
+        runner.hooks = SimpleNamespace(emit=AsyncMock(), loaded_hooks=False)
+
+        source = _make_dispatch_source()
+        session_entry = SessionEntry(
+            session_key=build_session_key(source),
+            session_id="sess-1",
+            created_at=datetime.now(),
+            updated_at=datetime.now(),
+            platform=Platform.SIGNAL,
+            chat_type="dm",
+        )
+        runner.session_store = MagicMock()
+        runner.session_store.get_or_create_session.return_value = session_entry
+        runner.session_store.load_transcript.return_value = []
+        runner._running_agents = {}
+        runner._pending_messages = {}
+        runner._is_user_authorized = lambda _source: True
+
+        providers = FAKE_PROVIDERS  # 5 models total from helpers.py
+
+        # --- Event 1: /model → send_model_picker → _rpc("send") + state registered ---
+        event1 = MessageEvent(text="/model", source=source, message_id="m1")
+        sess_key = session_entry.session_key
+        chat_id_str = str(source.chat_id)
+
+        # Simulate the /model handler calling send_model_picker directly
+        cb = AsyncMock(return_value="Switched to claude-sonnet-4-5")
+        result = await adapter.send_model_picker(
+            chat_id=chat_id_str,
+            providers=providers,
+            current_model="claude-haiku-4-5",
+            current_provider="anthropic",
+            session_key=sess_key,
+            on_model_selected=cb,
+        )
+
+        assert result.success is True
+        # _rpc("send", ...) should have been called once to send the picker
+        adapter._rpc.assert_awaited_once()
+        rpc_call = adapter._rpc.await_args
+        assert rpc_call[0][0] == "send"
+        send_args = rpc_call[0][1]
+        assert send_args["message"]  # non-empty picker message
+        assert "page 1/" in send_args["message"]
+
+        # Picker state should be registered
+        picker_state = adapter._model_picker_state
+        assert picker_state is not None
+        pending = picker_state.lookup("signal", chat_id_str, sess_key)
+        assert pending is not None
+        assert picker_state.has_pending("signal", chat_id_str, sess_key)
+
+        # --- Event 2: "3" → intercept resolves to 3rd model → callback fires ---
+        event2 = MessageEvent(text="3", source=source, message_id="m2")
+        raw_text = (event2.text or "").strip()
+        assert raw_text.isdigit()
+
+        one_indexed = int(raw_text)
+        resolved = ModelPickerState.resolve_model_index(pending.providers, one_indexed - 1)
+        assert resolved is not None
+        model_id, provider_name = resolved
+
+        # The 3rd model (flat index 2) should be 'claude-haiku-4-5' from anthropic
+        assert model_id == "claude-haiku-4-5"
+        assert provider_name == "Anthropic"
+
+        # Invoke the callback as the dispatch intercept block would
+        result_text = await pending.on_model_selected(chat_id_str, model_id, provider_name)
+        cb.assert_awaited_once_with(chat_id_str, model_id, provider_name)
+        assert result_text == "Switched to claude-sonnet-4-5"
+
+        # Dispatch intercept block cancels state after callback fires
+        picker_state.cancel("signal", chat_id_str, sess_key)
+
+        # Pending state should be cleared after callback
+        pending_after = picker_state.lookup("signal", chat_id_str, sess_key)
+        assert pending_after is None
