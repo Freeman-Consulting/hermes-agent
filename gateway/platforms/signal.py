@@ -37,6 +37,8 @@ from gateway.platforms.base import (
     cache_image_from_url,
 )
 from gateway.platforms.helpers import redact_phone
+from gateway.model_picker_state import ModelPickerState, PAGE_SIZE, PICKER_TTL_SECONDS
+from gateway.run import typing_during_command
 
 logger = logging.getLogger(__name__)
 
@@ -179,6 +181,9 @@ class SignalAdapter(BasePlatformAdapter):
         # in Note to Self / self-chat mode (mirrors WhatsApp recentlySentIds)
         self._recent_sent_timestamps: set = set()
         self._max_recent_timestamps = 50
+
+        # Pending /model picker state store (used by send_model_picker)
+        self._model_picker_state: Optional[ModelPickerState] = None
 
         logger.info("Signal adapter initialized: url=%s account=%s groups=%s",
                      self.http_url, redact_phone(self.account),
@@ -895,3 +900,88 @@ class SignalAdapter(BasePlatformAdapter):
             "type": "dm",
             "chat_id": chat_id,
         }
+
+    # ------------------------------------------------------------------
+    # Model Picker (interactive /model)
+    # ------------------------------------------------------------------
+
+    async def send_model_picker(
+        self,
+        chat_id: str,
+        providers: list,
+        current_model: str,
+        current_provider: str,
+        session_key: str,
+        on_model_selected,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Send a numbered model picker via Signal.
+
+        Users reply with a number (1-indexed) to pick a model, or \"more\"
+        for the next page.  Picker expires after PICKER_TTL_SECONDS.
+        """
+        if not self.client:
+            return SendResult(success=False, error="Signal not connected")
+
+        # Ensure picker state store is initialized
+        if self._model_picker_state is None:
+            self._model_picker_state = ModelPickerState()
+
+        # No models? Send a friendly message and return.
+        total_models = sum(len(p.get("models", [])) for p in providers)
+        if total_models == 0:
+            msg = "No models available.\n\n"
+            msg += f"Current model: {current_model or 'unknown'}\n"
+            msg += f"Provider: {current_provider}\n"
+            async with typing_during_command(self, chat_id):
+                result = await self._rpc("send", {
+                    "account": self.account,
+                    "message": msg,
+                    "recipient": [chat_id],
+                })
+            return SendResult(success=result is not None)
+
+        # Build the picker message (1-indexed display)
+        pagination = ModelPickerState.paginate_models(providers, page=0)
+        lines = [
+            f"⚙ Select a model (page 1/{pagination['total_pages']})",
+            "",
+            f"Current: {current_model or 'unknown'} ({current_provider})",
+            "",
+        ]
+        for idx, (_, model_id, provider_name) in enumerate(pagination["models"]):
+            short = model_id.split("/")[-1] if "/" in model_id else model_id
+            if len(short) > 40:
+                short = short[:37] + "..."
+            lines.append(f"  {idx + 1}. {short} ({provider_name})")
+
+        lines.append("")
+        if pagination["total_pages"] > 1:
+            lines.append("Reply with a number to select, or \"more\" for next page.")
+        else:
+            lines.append("Reply with a number to select.")
+
+        msg = "\n".join(lines)
+
+        async with typing_during_command(self, chat_id):
+            result = await self._rpc("send", {
+                "account": self.account,
+                "message": msg,
+                "recipient": [chat_id],
+            })
+
+        if result is None:
+            return SendResult(success=False, error="Failed to send picker")
+
+        # Register pending picker state
+        self._model_picker_state.add(
+            platform="signal",
+            chat_id=chat_id,
+            session_key=session_key,
+            providers=providers,
+            current_model=current_model,
+            current_provider=current_provider,
+            on_model_selected=on_model_selected,
+        )
+
+        return SendResult(success=True)

@@ -419,3 +419,235 @@ class TestSuggestCommand:
         # difflib.get_close_matches cutoff=0.95 — "modle" vs "model"
         # ratio ≈ 0.8, so this should return None
         assert result is None
+
+
+# ---------------------------------------------------------------------------
+# SignalAdapter.send_model_picker (unit)
+# ---------------------------------------------------------------------------
+
+class TestSignalSendModelPicker:
+    """Test SignalAdapter.send_model_picker using a real adapter with _rpc mocked."""
+
+    def _build_providers(self):
+        return [
+            {
+                "name": "openai",
+                "models": ["gpt-4o", "gpt-4o-mini"],
+            },
+            {
+                "name": "anthropic",
+                "models": ["claude-opus-4-6", "claude-sonnet-4-5"],
+            },
+        ]
+
+    @pytest.mark.asyncio
+    async def test_send_model_picker_sends_message(self):
+        from gateway.platforms.signal import SignalAdapter
+
+        adapter = SignalAdapter.__new__(SignalAdapter)
+        adapter.account = "+15550001234"
+        adapter.client = MagicMock()  # truthy — connected
+        adapter._model_picker_state = None
+        adapter._rpc = AsyncMock(return_value={"id": "msg-1"})
+
+        result = await adapter.send_model_picker(
+            chat_id="+15550009999",
+            providers=self._build_providers(),
+            current_model="gpt-4o",
+            current_provider="openai",
+            session_key="sess-abc",
+            on_model_selected=lambda *a, **k: None,
+        )
+
+        assert result.success is True
+        adapter._rpc.assert_called_once()
+        call_args = adapter._rpc.call_args
+        assert call_args[0][0] == "send"
+        params = call_args[0][1]
+        assert params["account"] == "+15550001234"
+        assert params["recipient"] == ["+15550009999"]
+        assert "gpt-4o" in params["message"]
+        assert "claude-opus-4-6" in params["message"]
+
+    @pytest.mark.asyncio
+    async def test_send_model_picker_registers_state(self):
+        from gateway.platforms.signal import SignalAdapter
+
+        adapter = SignalAdapter.__new__(SignalAdapter)
+        adapter.account = "+15550001234"
+        adapter.client = MagicMock()
+        adapter._model_picker_state = None
+        adapter._rpc = AsyncMock(return_value={"id": "msg-1"})
+
+        await adapter.send_model_picker(
+            chat_id="+15550009999",
+            providers=self._build_providers(),
+            current_model="gpt-4o",
+            current_provider="openai",
+            session_key="sess-abc",
+            on_model_selected=lambda *a, **k: None,
+        )
+
+        # State store should be initialized and contain the picker
+        assert adapter._model_picker_state is not None
+        entry = adapter._model_picker_state.lookup(
+            platform="signal", chat_id="+15550009999", session_key="sess-abc"
+        )
+        assert entry is not None
+        assert entry.session_key == "sess-abc"
+
+    @pytest.mark.asyncio
+    async def test_send_model_picker_no_models(self):
+        from gateway.platforms.signal import SignalAdapter
+
+        adapter = SignalAdapter.__new__(SignalAdapter)
+        adapter.account = "+15550001234"
+        adapter.client = MagicMock()
+        adapter._model_picker_state = None
+        adapter._rpc = AsyncMock(return_value={"id": "msg-1"})
+
+        result = await adapter.send_model_picker(
+            chat_id="+15550009999",
+            providers=[],
+            current_model="gpt-4o",
+            current_provider="openai",
+            session_key="sess-abc",
+            on_model_selected=lambda *a, **k: None,
+        )
+
+        assert result.success is True
+        call_args = adapter._rpc.call_args
+        params = call_args[0][1]
+        assert "No models available" in params["message"]
+
+    @pytest.mark.asyncio
+    async def test_send_model_picker_not_connected(self):
+        from gateway.platforms.signal import SignalAdapter
+
+        adapter = SignalAdapter.__new__(SignalAdapter)
+        adapter.account = "+15550001234"
+        adapter.client = None
+        adapter._model_picker_state = None
+
+        result = await adapter.send_model_picker(
+            chat_id="+15550009999",
+            providers=self._build_providers(),
+            current_model="gpt-4o",
+            current_provider="openai",
+            session_key="sess-abc",
+            on_model_selected=lambda *a, **k: None,
+        )
+
+        assert result.success is False
+        assert "not connected" in result.error
+
+    @pytest.mark.asyncio
+    async def test_send_model_picker_rpc_failure(self):
+        from gateway.platforms.signal import SignalAdapter
+
+        adapter = SignalAdapter.__new__(SignalAdapter)
+        adapter.account = "+15550001234"
+        adapter.client = MagicMock()
+        adapter._model_picker_state = None
+        adapter._rpc = AsyncMock(return_value=None)
+
+        result = await adapter.send_model_picker(
+            chat_id="+15550009999",
+            providers=self._build_providers(),
+            current_model="gpt-4o",
+            current_provider="openai",
+            session_key="sess-abc",
+            on_model_selected=lambda *a, **k: None,
+        )
+
+        assert result.success is False
+        assert "Failed" in result.error
+
+    @pytest.mark.asyncio
+    async def test_send_model_picker_message_formatting(self):
+        from gateway.platforms.signal import SignalAdapter
+
+        adapter = SignalAdapter.__new__(SignalAdapter)
+        adapter.account = "+15550001234"
+        adapter.client = MagicMock()
+        adapter._model_picker_state = None
+        adapter._rpc = AsyncMock(return_value={"id": "msg-1"})
+
+        await adapter.send_model_picker(
+            chat_id="+15550009999",
+            providers=self._build_providers(),
+            current_model="gpt-4o",
+            current_provider="openai",
+            session_key="sess-abc",
+            on_model_selected=lambda *a, **k: None,
+        )
+
+        call_args = adapter._rpc.call_args
+        message = call_args[0][1]["message"]
+
+        # Should have numbered items (1-indexed)
+        assert "  1. gpt-4o" in message
+        assert "  2. gpt-4o-mini" in message
+        assert "  3. claude-opus-4-6" in message
+        assert "  4. claude-sonnet-4-5" in message
+
+        # Should show current model
+        assert "Current: gpt-4o (openai)" in message
+
+    @pytest.mark.asyncio
+    async def test_send_model_picker_shortens_long_model_ids(self):
+        from gateway.platforms.signal import SignalAdapter
+
+        adapter = SignalAdapter.__new__(SignalAdapter)
+        adapter.account = "+15550001234"
+        adapter.client = MagicMock()
+        adapter._model_picker_state = None
+        adapter._rpc = AsyncMock(return_value={"id": "msg-1"})
+
+        providers = [
+            {
+                "name": "test",
+                "models": ["very-long-model-id-that-exceeds-forty-characters"],
+            }
+        ]
+
+        await adapter.send_model_picker(
+            chat_id="+15550009999",
+            providers=providers,
+            current_model="",
+            current_provider="test",
+            session_key="sess-abc",
+            on_model_selected=lambda *a, **k: None,
+        )
+
+        call_args = adapter._rpc.call_args
+        message = call_args[0][1]["message"]
+
+        # Long model ID should be truncated with ...
+        assert "..." in message
+        # Should not contain the full original string
+        assert "very-long-model-id-that-exceeds-forty-characters" not in message
+
+    @pytest.mark.asyncio
+    async def test_send_model_picker_calls_typing(self):
+        from gateway.platforms.signal import SignalAdapter
+
+        adapter = SignalAdapter.__new__(SignalAdapter)
+        adapter.account = "+155****1234"
+        adapter.client = MagicMock()
+        adapter._model_picker_state = None
+        adapter._rpc = AsyncMock(return_value={"id": "msg-1"})
+        adapter.send_typing = AsyncMock()
+        adapter.stop_typing = AsyncMock()
+
+        await adapter.send_model_picker(
+            chat_id="+155****9999",
+            providers=self._build_providers(),
+            current_model="gpt-4o",
+            current_provider="openai",
+            session_key="sess-abc",
+            on_model_selected=lambda *a, **k: None,
+        )
+
+        adapter.send_typing.assert_called_once_with("+155****9999")
+        adapter.stop_typing.assert_called_once_with("+155****9999")
