@@ -37,6 +37,8 @@ from gateway.platforms.base import (
     cache_image_from_url,
 )
 from gateway.platforms.helpers import redact_phone
+from gateway.model_picker_state import ModelPickerState
+from gateway.run import typing_during_command
 
 logger = logging.getLogger(__name__)
 
@@ -179,6 +181,9 @@ class SignalAdapter(BasePlatformAdapter):
         # in Note to Self / self-chat mode (mirrors WhatsApp recentlySentIds)
         self._recent_sent_timestamps: set = set()
         self._max_recent_timestamps = 50
+
+        # Pending /model picker state store (used by send_model_picker)
+        self._model_picker_state: Optional[ModelPickerState] = None
 
         logger.info("Signal adapter initialized: url=%s account=%s groups=%s",
                      self.http_url, redact_phone(self.account),
@@ -895,3 +900,443 @@ class SignalAdapter(BasePlatformAdapter):
             "type": "dm",
             "chat_id": chat_id,
         }
+
+    # ------------------------------------------------------------------
+    # Model Picker (interactive /model)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _build_picker_send_params(
+        account: str, chat_id: str, message: str
+    ) -> Dict[str, Any]:
+        """Build the params dict for a signal-cli ``send`` RPC call.
+
+        Routes to ``groupId`` for group chats (``group:…`` prefix) and
+        to ``recipient`` for direct messages.  Extracted so every picker
+        send path uses the same group/DM branching logic.
+        """
+        params: Dict[str, Any] = {
+            "account": account,
+            "message": message,
+        }
+        if chat_id.startswith("group:"):
+            params["groupId"] = chat_id[6:]
+        else:
+            params["recipient"] = [chat_id]
+        return params
+
+    async def send_model_picker(
+        self,
+        chat_id: str,
+        providers: list,
+        current_model: str,
+        current_provider: str,
+        session_key: str,
+        on_model_selected,
+        metadata: Optional[Dict[str, Any]] = None,
+        page: int = 0,
+        provider_filter: Optional[str] = None,
+    ) -> SendResult:
+        """Send a numbered model picker via Signal.
+
+        Users reply with a number (1-indexed) to pick a model, or "more"
+        for the next page.  Picker expires after PICKER_TTL_SECONDS.
+
+        Args:
+            chat_id: Recipient chat identifier.
+            providers: List of provider dicts with model lists.
+            current_model: The user's currently active model.
+            current_provider: The user's currently active provider slug.
+            session_key: Hermes session key for state tracking.
+            on_model_selected: Callback invoked on model selection.
+            metadata: Optional extra metadata (e.g. thread_id).
+            page: Page index to render (0-based, default 0).
+            provider_filter: Optional provider slug/name to filter models by.
+        """
+        if not self.client:
+            return SendResult(success=False, error="Signal not connected")
+
+        # Ensure picker state store is initialized
+        if self._model_picker_state is None:
+            self._model_picker_state = ModelPickerState()
+
+        # Filter providers if provider_filter is set
+        filtered_providers = providers
+        provider_name = None
+        if provider_filter:
+            provider_filter_lower = provider_filter.lower()
+            matching_providers = [
+                p for p in providers
+                if (p.get("slug", "").lower() == provider_filter_lower or
+                    p.get("name", "").lower() == provider_filter_lower)
+            ]
+            if matching_providers:
+                filtered_providers = matching_providers
+                provider_name = matching_providers[0].get("name", provider_filter)
+            else:
+                # No matching provider - reset to show all models
+                filtered_providers = providers
+                provider_filter = None
+
+        # No models? Send a friendly message and return.
+        total_models = sum(len(p.get("models", [])) for p in filtered_providers)
+        if total_models == 0:
+            if provider_filter and provider_name:
+                # Edge case: selected provider has 0 models
+                msg = f"No models available from {provider_name}.\n\n"
+                msg += 'Reply 0 to see all providers.\n'
+                msg += f"Current model: {current_model or 'unknown'}\n"
+                msg += f"Provider: {current_provider}\n"
+            else:
+                msg = "No models available.\n\n"
+                msg += f"Current model: {current_model or 'unknown'}\n"
+                msg += f"Provider: {current_provider}\n"
+            async with typing_during_command(self, chat_id):
+                result = await self._rpc(
+                    "send",
+                    self._build_picker_send_params(self.account, chat_id, msg),
+                )
+            return SendResult(success=result is not None)
+
+        # Build the picker message (1-indexed display)
+        pagination = ModelPickerState.paginate_models(filtered_providers, page=page)
+
+        # Update header based on whether we're filtering by provider
+        if provider_filter and provider_name:
+            header = f"⚙ Models from {provider_name} (page {page + 1}/{pagination['total_pages']})"
+        else:
+            header = f"⚙ Select a model (page {page + 1}/{pagination['total_pages']})"
+
+        lines = [
+            header,
+            "",
+            f"Current: {current_model or 'unknown'} ({current_provider})",
+            "",
+        ]
+
+        # Fetch pricing per provider on-demand (cached, so cheap on repeats)
+        try:
+            from hermes_cli.models import (
+                get_pricing_for_provider,
+                _format_price_per_mtok,
+            )
+        except Exception:
+            get_pricing_for_provider = None
+            _format_price_per_mtok = None
+
+        pricing_by_provider: Dict[str, dict] = {}
+        if get_pricing_for_provider is not None:
+            seen_slugs_for_pricing: set = set()
+            for _p in filtered_providers:
+                _slug = _p.get("slug", "")
+                if not _slug or _slug in seen_slugs_for_pricing:
+                    continue
+                seen_slugs_for_pricing.add(_slug)
+                try:
+                    pricing_by_provider[_slug] = get_pricing_for_provider(_slug) or {}
+                except Exception:
+                    pricing_by_provider[_slug] = {}
+
+        # Build a model_id -> slug map so we can look up pricing per row
+        model_to_slug: Dict[str, str] = {}
+        for _p in filtered_providers:
+            _slug = _p.get("slug", "")
+            for _mid in _p.get("models", []):
+                # First provider wins if duplicates
+                model_to_slug.setdefault(_mid, _slug)
+
+        for flat_idx, model_id, provider_name_display in pagination["models"]:
+            short = model_id.split("/")[-1] if "/" in model_id else model_id
+            if len(short) > 40:
+                short = short[:37] + "..."
+
+            price_part = ""
+            if _format_price_per_mtok is not None:
+                _slug = model_to_slug.get(model_id, "")
+                _pricing_map = pricing_by_provider.get(_slug, {})
+                _pp = _pricing_map.get(model_id)
+                if _pp:
+                    inp = _format_price_per_mtok(_pp.get("prompt", ""))
+                    out = _format_price_per_mtok(_pp.get("completion", ""))
+                    if inp and out and inp != "?" and out != "?":
+                        price_part = f"  [In {inp} / Out {out}]"
+
+            lines.append(f"  {flat_idx + 1}. {short} ({provider_name_display}){price_part}")
+
+        lines.append("")
+        if pagination["total_pages"] > 1:
+            first = pagination["models"][0][0] + 1
+            last = pagination["models"][-1][0] + 1
+            lines.append(f"Reply with a number ({first}–{last}) to select, or \"more\" for next page.")
+        else:
+            lines.append("Reply with a number to select.")
+        lines.append('Reply "cancel" to keep current model.')
+
+        msg = "\n".join(lines)
+
+        async with typing_during_command(self, chat_id):
+            result = await self._rpc(
+                "send",
+                self._build_picker_send_params(self.account, chat_id, msg),
+            )
+
+        if result is None:
+            return SendResult(success=False, error="Failed to send picker")
+
+        # Register pending picker state
+        self._model_picker_state.add(
+            platform="signal",
+            chat_id=chat_id,
+            session_key=session_key,
+            providers=filtered_providers,
+            current_model=current_model,
+            current_provider=current_provider,
+            on_model_selected=on_model_selected,
+            current_page=page,
+        )
+
+        return SendResult(success=True)
+
+    # ------------------------------------------------------------------
+    # Provider Picker (two-step provider-first model selection)
+    # ------------------------------------------------------------------
+
+    _PROVIDER_PAGE_SIZE = 12
+
+    # Curated provider display order (from DESIGN_DECISIONS)
+    _CURATED_PROVIDER_ORDER: Dict[str, int] = {
+        "nous": 0,
+        "openrouter": 1,
+        "openai": 2,
+        "anthropic": 3,
+        "google": 4,
+        "azure": 5,
+        "aws-bedrock": 6,
+        "xai": 7,
+        "mistral": 8,
+        "cohere": 9,
+        "deepseek": 10,
+    }
+
+    def _sort_providers_curated(self, providers: List[dict]) -> List[dict]:
+        """Sort providers by curated order, then alphabetically."""
+        def sort_key(p):
+            slug = p.get("slug", p.get("name", "")).lower()
+            # Check if it's a local provider (typically ollama, llamacpp, etc.)
+            is_local = slug in ("ollama", "llamacpp", "localai", "text-generation-webui", "vllm", "lmstudio")
+            if is_local:
+                return (11, slug)  # Local providers after curated
+            curated_idx = self._CURATED_PROVIDER_ORDER.get(slug, 999)
+            return (curated_idx, slug)
+
+        return sorted(providers, key=sort_key)
+
+    def _format_provider_list(
+        self,
+        providers: List[dict],
+        page: int = 0,
+    ) -> dict:
+        """Paginate and format provider entries for display.
+
+        Returns a dict with:
+            - lines: list of formatted display lines
+            - page: current page number (0-indexed)
+            - total_pages: total number of pages
+            - has_next: whether a next page exists
+            - providers_on_page: list of (global_index, provider) tuples for this page
+            - start_idx: starting global index (0-based, after item 0)
+        """
+        # Sort providers by curated order
+        sorted_providers = self._sort_providers_curated(providers)
+        total = len(sorted_providers)
+
+        # Item 0 is "All providers", so provider entries start at global index 1
+        # Pagination applies to providers only (item 0 is always shown)
+        max_providers_per_page = self._PROVIDER_PAGE_SIZE
+        total_provider_pages = max(1, (total + max_providers_per_page - 1) // max_providers_per_page)
+        page = max(0, min(page, total_provider_pages - 1))
+
+        start = page * max_providers_per_page
+        end = min(start + max_providers_per_page, total)
+
+        lines = []
+        providers_on_page = []
+
+        # Item 0: "All providers"
+        total_models = sum(len(p.get("models", [])) for p in providers)
+        lines.append(f"0. All providers — show all models ({total_models} total)")
+
+        # Provider entries (1-indexed display, global index)
+        for i, prov in enumerate(sorted_providers[start:end], start=start):
+            display_num = i + 1  # 1-based global numbering
+            name = prov.get("name", prov.get("slug", "unknown"))
+            model_count = prov.get("total_models", len(prov.get("models", [])))
+            current_marker = " ✓" if prov.get("is_current") else ""
+            lines.append(f"{display_num}. {name} ({model_count} models){current_marker}")
+            providers_on_page.append((display_num, prov))
+
+        # "More..." option if there are more providers
+        has_next = (page + 1) < total_provider_pages and total > end
+        if has_next:
+            lines.append(f"{end + 1}. More...")
+
+        return {
+            "lines": lines,
+            "page": page,
+            "total_pages": total_provider_pages,
+            "has_next": has_next,
+            "providers_on_page": providers_on_page,
+            "start_idx": 1 + start,  # First provider number on this page (1-based)
+            "end_idx": end,  # Last provider number (1-based, not including "More...")
+        }
+
+    async def send_provider_picker(
+        self,
+        chat_id: str,
+        providers: list,
+        current_model: str,
+        current_provider: str,
+        session_key: str,
+        on_provider_selected,
+        metadata: Optional[Dict[str, Any]] = None,
+        page: int = 0,
+    ) -> SendResult:
+        """Send a numbered provider picker via Signal.
+
+        Users reply with a number to pick a provider, "0" for all providers,
+        or "more" for the next page. Picker expires after PICKER_TTL_SECONDS.
+
+        Args:
+            chat_id: Recipient chat identifier.
+            providers: List of provider dicts with model lists.
+            current_model: The user's currently active model.
+            current_provider: The user's currently active provider slug.
+            session_key: Hermes session key for state tracking.
+            on_provider_selected: Callback invoked on provider selection.
+            metadata: Optional extra metadata (e.g. thread_id).
+            page: Page index to render (0-based, default 0).
+        """
+        if not self.client:
+            return SendResult(success=False, error="Signal not connected")
+
+        # Ensure picker state store is initialized
+        if self._model_picker_state is None:
+            self._model_picker_state = ModelPickerState()
+
+        # No providers? Fall back to model picker
+        if not providers:
+            msg = "No providers available.\n\n"
+            msg += f"Current model: {current_model or 'unknown'}\n"
+            msg += f"Provider: {current_provider}\n"
+            async with typing_during_command(self, chat_id):
+                result = await self._rpc(
+                    "send",
+                    self._build_picker_send_params(self.account, chat_id, msg),
+                )
+            return SendResult(success=result is not None)
+
+        # Build the provider list
+        formatted = self._format_provider_list(providers, page=page)
+
+        # Build message
+        lines = [
+            f"⚙ Select a provider (page {page + 1}/{formatted['total_pages']})",
+            "",
+            f"Current: {current_model or 'unknown'} ({current_provider})",
+            "",
+        ]
+        lines.extend(formatted["lines"])
+        lines.append("")
+
+        if formatted["has_next"]:
+            lines.append('Reply with a number (0 for all, or "more" for next page).')
+        else:
+            lines.append("Reply with a number to select.")
+        lines.append('Reply "cancel" to keep current model.')
+
+        msg = "\n".join(lines)
+
+        async with typing_during_command(self, chat_id):
+            result = await self._rpc(
+                "send",
+                self._build_picker_send_params(self.account, chat_id, msg),
+            )
+
+        if result is None:
+            return SendResult(success=False, error="Failed to send provider picker")
+
+        # Register pending picker state with step='provider'
+        self._model_picker_state.add(
+            platform="signal",
+            chat_id=chat_id,
+            session_key=session_key,
+            providers=providers,
+            current_model=current_model,
+            current_provider=current_provider,
+            on_model_selected=on_provider_selected,
+            current_page=page,
+            step="provider",
+            selected_provider=None,
+        )
+
+        return SendResult(success=True)
+
+    def _handle_provider_pagination(
+        self,
+        reply_text: str,
+        providers: list,
+        current_page: int,
+    ) -> tuple:
+        """Resolve user reply for provider list pagination.
+
+        Args:
+            reply_text: The user's reply text (lowercased).
+            providers: List of provider dicts.
+            current_page: Current page index.
+
+        Returns:
+            Tuple of (action, value) where action is one of:
+                - "select_provider": value is provider slug
+                - "select_all": value is None (user chose "0. All providers")
+                - "next_page": value is next page number
+                - "invalid": value is None (unrecognized reply)
+        """
+        reply_lower = reply_text.strip().lower()
+
+        # Check for "more" to advance page
+        if reply_lower == "more":
+            formatted = self._format_provider_list(providers, page=current_page)
+            if formatted["has_next"]:
+                return ("next_page", current_page + 1)
+            return ("invalid", None)
+
+        # Try to parse as number
+        try:
+            num = int(reply_lower)
+        except ValueError:
+            return ("invalid", None)
+
+        # Item 0: "All providers"
+        if num == 0:
+            return ("select_all", None)
+
+        # Validate number is in range
+        sorted_providers = self._sort_providers_curated(providers)
+        total = len(sorted_providers)
+
+        # Calculate valid range for current page
+        max_per_page = self._PROVIDER_PAGE_SIZE
+        start = current_page * max_per_page
+        end = min(start + max_per_page, total)
+
+        # num is 1-based global index
+        if num < 1 or num > end + 1:  # +1 because provider numbers start at 1
+            return ("invalid", None)
+
+        # Map number to provider
+        provider_idx = num - 1  # Convert to 0-based index
+        if provider_idx >= len(sorted_providers):
+            return ("invalid", None)
+
+        selected = sorted_providers[provider_idx]
+        return ("select_provider", selected.get("slug", selected.get("name")))

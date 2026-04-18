@@ -25,6 +25,7 @@ import tempfile
 import threading
 import time
 from collections import OrderedDict
+from contextlib import asynccontextmanager
 from contextvars import copy_context
 from pathlib import Path
 from datetime import datetime
@@ -288,6 +289,21 @@ from gateway.restart import (
     GATEWAY_SERVICE_RESTART_EXIT_CODE,
     parse_restart_drain_timeout,
 )
+from gateway.model_picker_state import ModelPickerState
+
+# Keywords that cancel a pending /model picker and keep the current model.
+# Case-insensitive exact match on the user's reply. Works on both the
+# provider-selection step and the model-selection step.
+_PICKER_CANCEL_KEYWORDS = frozenset({
+    "cancel",
+    "leave",
+    "keep",
+    "x",
+    "nevermind",
+    "never mind",
+    "no",
+})
+
 
 
 def _normalize_whatsapp_identifier(value: str) -> str:
@@ -557,6 +573,72 @@ def _format_gateway_process_notification(evt: dict) -> "str | None":
         text += "]"
         return text
 
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Runtime helpers used by command dispatch
+# ---------------------------------------------------------------------------
+
+
+@asynccontextmanager
+async def typing_during_command(adapter, chat_id: str):
+    """Context manager that sends typing indicator while a command runs.
+
+    Calls ``adapter.send_typing(chat_id)`` on enter and
+    ``adapter.stop_typing(chat_id)`` on exit, using duck-typing via
+    ``getattr()`` so adapters without typing support are no-ops.
+
+    Exceptions from send/stop are suppressed — a failed typing indicator
+    must never kill the command handler.
+    """
+    send_fn = getattr(adapter, "send_typing", None)
+    stop_fn = getattr(adapter, "stop_typing", None)
+
+    try:
+        if send_fn is not None:
+            await send_fn(chat_id)
+    except Exception:
+        logger.debug("typing indicator (send) failed", exc_info=True)
+
+    try:
+        yield
+    finally:
+        try:
+            if stop_fn is not None:
+                await stop_fn(chat_id)
+        except Exception:
+            logger.debug("typing indicator (stop) failed", exc_info=True)
+
+
+def suggest_command(user_input: str, threshold: float = 0.6) -> Optional[str]:
+    """Return a suggested command for a typo'd user input.
+
+    Strips a leading ``/`` from *user_input* before matching against
+    ``GATEWAY_KNOWN_COMMANDS``.  Returns the best match with ``/``
+    prepended, or ``None`` if no match exceeds *threshold*.
+
+    Examples:
+        >>> suggest_command("/modle")
+        '/model'
+        >>> suggest_command("xyzzy")
+        None
+        >>> suggest_command("/help")
+        '/help'
+    """
+    import difflib
+    from hermes_cli.commands import GATEWAY_KNOWN_COMMANDS
+
+    raw = user_input.strip()
+    if not raw:
+        return None
+
+    needle = raw.lstrip("/")
+    matches = difflib.get_close_matches(
+        needle, GATEWAY_KNOWN_COMMANDS, n=1, cutoff=threshold
+    )
+    if matches:
+        return "/" + matches[0]
     return None
 
 
@@ -3171,6 +3253,113 @@ class GatewayRunner:
                 self._pending_messages[_quick_key] = event.text
             return None
 
+        # ---- Pending-picker intercept (before command dispatch) ----
+        # If this chat has a pending /model picker and the user sent a number
+        # (or "more"), route it to the picker callback.  If they sent any
+        # /command, cancel the pending picker cleanly.  Any other text falls
+        # through to normal agent handling.
+        adapter = self.adapters.get(source.platform)
+        picker_state = getattr(adapter, "_model_picker_state", None) if adapter else None
+
+        # Cheap gate: only pay for the session_store DB lookup if *any* picker
+        # entry exists for this chat (expired or live).  We peek at the store
+        # using the quick-key already computed upstream — which matches the
+        # canonical session_key for any session_store currently in use — so
+        # non-pending messages don't hit the DB.
+        _picker_possibly_pending = False
+        if picker_state is not None:
+            _peek_key = (
+                source.platform.value if source.platform else "",
+                str(source.chat_id),
+                _quick_key,
+            )
+            if _peek_key in picker_state._store:
+                _picker_possibly_pending = True
+
+        if picker_state is not None and _picker_possibly_pending:
+            platform_str = source.platform.value if source.platform else ""
+            chat_id_str = str(source.chat_id)
+            session_entry = self.session_store.get_or_create_session(source)
+            sess_key = session_entry.session_key
+
+            # Check for expired picker before normal lookup
+            expired = picker_state.check_expired(platform_str, chat_id_str, sess_key)
+            raw_text = (event.text or "").strip()
+
+            if expired is not None and raw_text.isdigit():
+                # User replied with a number after TTL expired
+                return "Picker expired — run `/model` again to pick a new model."
+
+            pending = picker_state.lookup(platform_str, chat_id_str, sess_key)
+            if pending is not None:
+                # "Leave unchanged" keyword → cancel picker, confirm current model.
+                # Works on both step='provider' and step='model'.
+                if raw_text.lower() in _PICKER_CANCEL_KEYWORDS:
+                    picker_state.cancel(platform_str, chat_id_str, sess_key)
+                    return (
+                        f"Keeping current: {pending.current_model or 'unknown'} "
+                        f"({pending.current_provider})"
+                    )
+
+                # User sent a slash command → cancel pending state, let dispatch continue
+                if raw_text.startswith("/"):
+                    picker_state.cancel(platform_str, chat_id_str, sess_key)
+                    # fall through to normal command dispatch below
+
+                # Two-step picker: provider step
+                elif pending.step == 'provider':
+                    # Route to provider selection handler.  Returns True if the
+                    # reply was handled (valid number / "more" / etc.) or False
+                    # if the reply was unrecognised — in which case the picker
+                    # was cancelled and we fall through so the agent sees the
+                    # text, mirroring the model-step behaviour below.
+                    handled = await self._handle_provider_selection_reply(
+                        adapter, pending, raw_text,
+                        platform_str, chat_id_str, sess_key,
+                        source
+                    )
+                    if handled is True:
+                        return None  # picker sent asynchronously; no text reply
+                    if isinstance(handled, str):
+                        return handled  # explicit text response (e.g. out-of-range)
+                    # handled is False → picker cancelled, fall through to agent
+
+                # Two-step picker: model step (existing single-step behavior)
+                # Bare number reply → resolve and invoke callback
+                elif raw_text.isdigit():
+                    one_indexed = int(raw_text)
+                    # resolve_model_index is 0-indexed; UI is 1-indexed
+                    resolved = ModelPickerState.resolve_model_index(
+                        pending.providers, one_indexed - 1
+                    )
+                    if resolved is None:
+                        total = sum(len(p.get("models", [])) for p in pending.providers)
+                        return f"Number out of range. Reply 1–{total} or 'more'."
+                    model_id, provider_slug = resolved
+                    # Invoke callback (async)
+                    try:
+                        result_text = await pending.on_model_selected(
+                            chat_id_str, model_id, provider_slug
+                        )
+                    except Exception as e:
+                        logger.exception("Model picker callback failed")
+                        picker_state.cancel(platform_str, chat_id_str, sess_key)
+                        return f"Failed to switch model: {e}"
+                    # Clear pending state after successful switch
+                    picker_state.cancel(platform_str, chat_id_str, sess_key)
+                    return result_text or f"Switched to {model_id}."
+
+                # "more" reply → re-send picker with next page
+                elif raw_text.lower() == "more":
+                    return await self._handle_picker_more(
+                        adapter, pending, platform_str, chat_id_str, sess_key
+                    )
+
+                # Anything else (e.g. free-form agent query) → expire picker, fall through
+                else:
+                    picker_state.cancel(platform_str, chat_id_str, sess_key)
+                    # fall through to normal handling
+
         # Check for commands
         command = event.get_command()
         
@@ -5168,15 +5357,27 @@ class GatewayRunner:
                         return "\n".join(lines)
 
                     metadata = {"thread_id": source.thread_id} if source.thread_id else None
-                    result = await adapter.send_model_picker(
-                        chat_id=source.chat_id,
-                        providers=providers,
-                        current_model=current_model,
-                        current_provider=current_provider,
-                        session_key=session_key,
-                        on_model_selected=_on_model_selected,
-                        metadata=metadata,
-                    )
+                    # Use two-step provider picker when available, fall back to flat model list
+                    if getattr(type(adapter), "send_provider_picker", None) is not None:
+                        result = await adapter.send_provider_picker(
+                            chat_id=source.chat_id,
+                            providers=providers,
+                            current_model=current_model,
+                            current_provider=current_provider,
+                            session_key=session_key,
+                            on_provider_selected=_on_model_selected,
+                            metadata=metadata,
+                        )
+                    else:
+                        result = await adapter.send_model_picker(
+                            chat_id=source.chat_id,
+                            providers=providers,
+                            current_model=current_model,
+                            current_provider=current_provider,
+                            session_key=session_key,
+                            on_model_selected=_on_model_selected,
+                            metadata=metadata,
+                        )
                     if result.success:
                         return None  # Picker sent — adapter handles the response
 
@@ -5185,6 +5386,11 @@ class GatewayRunner:
             lines = [f"Current: `{current_model or 'unknown'}` on {provider_label}", ""]
 
             try:
+                from hermes_cli.models import (
+                    get_pricing_for_provider,
+                    _format_price_per_mtok,
+                )
+
                 providers = list_authenticated_providers(
                     current_provider=current_provider,
                     user_providers=user_provs,
@@ -5195,9 +5401,30 @@ class GatewayRunner:
                     tag = " (current)" if p["is_current"] else ""
                     lines.append(f"**{p['name']}** `--provider {p['slug']}`{tag}:")
                     if p["models"]:
-                        model_strs = ", ".join(f"`{m}`" for m in p["models"])
-                        extra = f" (+{p['total_models'] - len(p['models'])} more)" if p["total_models"] > len(p["models"]) else ""
-                        lines.append(f"  {model_strs}{extra}")
+                        # Fetch pricing for this provider
+                        pricing: dict = {}
+                        try:
+                            pricing = get_pricing_for_provider(p["slug"]) or {}
+                        except Exception:
+                            pricing = {}
+
+                        has_any_pricing = bool(pricing and any(pricing.get(m) for m in p["models"]))
+
+                        if has_any_pricing:
+                            # Compact pricing table
+                            for m in p["models"]:
+                                pp = pricing.get(m, {})
+                                inp = _format_price_per_mtok(pp.get("prompt", "")) if pp else ""
+                                out = _format_price_per_mtok(pp.get("completion", "")) if pp else ""
+                                marker = "  ← current" if m == current_model else ""
+                                price_part = ""
+                                if inp or out:
+                                    price_part = f"  In:{inp}  Out:{out}/Mtok"
+                                lines.append(f"    `{m}`{price_part}{marker}")
+                        else:
+                            model_strs = ", ".join(f"`{m}`" for m in p["models"])
+                            extra = f" (+{p['total_models'] - len(p['models'])} more)" if p["total_models"] > len(p["models"]) else ""
+                            lines.append(f"  {model_strs}{extra}")
                     elif p.get("api_url"):
                         lines.append(f"  `{p['api_url']}`")
                     lines.append("")
@@ -5331,6 +5558,246 @@ class GatewayRunner:
             lines.append("_(session only -- add `--global` to persist)_")
 
         return "\n".join(lines)
+
+    async def _handle_picker_more(
+        self,
+        adapter: BasePlatformAdapter,
+        pending: Any,
+        platform_str: str,
+        chat_id_str: str,
+        sess_key: str,
+    ) -> Optional[str]:
+        """Handle 'more' reply: re-send picker with next page.
+
+        Increments the current_page on the entry and calls send_model_picker
+        with the new page index.  Wraps around to page 0 if past the end.
+        """
+        picker_state: ModelPickerState = adapter._model_picker_state
+        pagination = ModelPickerState.paginate_models(pending.providers, page=0)
+        total_pages = pagination["total_pages"]
+
+        # Compute next page; wrap around if past the end
+        new_page = (pending.current_page + 1) % total_pages
+
+        # Update the entry's current_page via the public API
+        picker_state.mark_page(platform_str, chat_id_str, sess_key, new_page)
+
+        # Re-send with the new page
+        metadata = {
+            "thread_id": adapter._last_source.thread_id
+        } if getattr(adapter, "_last_source", None) and getattr(adapter._last_source, "thread_id", None) else None
+
+        result = await adapter.send_model_picker(
+            chat_id=chat_id_str,
+            providers=pending.providers,
+            current_model=pending.current_model,
+            current_provider=pending.current_provider,
+            session_key=sess_key,
+            on_model_selected=pending.on_model_selected,
+            metadata=metadata,
+            page=new_page,
+        )
+
+        if not result.success:
+            return f"Failed to re-send picker: {result.error}"
+        return None  # Picker sent; adapter handles the response
+
+    async def _handle_provider_selection_reply(
+        self,
+        adapter: Any,
+        pending: Any,
+        raw_text: str,
+        platform_str: str,
+        chat_id_str: str,
+        sess_key: str,
+        source: SessionSource,
+    ):
+        """Handle user reply during provider selection step (step='provider').
+
+        Routes based on reply:
+        - "0": Show all models (advance to step='model' with all providers)
+        - "more": Increment page and re-send provider picker
+        - N (number): Look up provider by global index, filter, advance to step='model'
+
+        Returns:
+            - ``True`` when the reply was fully handled and the picker was
+              re-sent asynchronously (no text reply from the caller).
+            - A ``str`` when the caller should send that text back to the user
+              (e.g. out-of-range error or send-failure message).
+            - ``False`` when the reply was unrecognised — the picker has been
+              cancelled and the caller should fall through to normal agent
+              dispatch so the user's text reaches the assistant.
+        """
+        picker_state: ModelPickerState = adapter._model_picker_state
+        key = (platform_str, chat_id_str, sess_key)
+
+        reply_lower = raw_text.lower()
+
+        # "more" reply → re-send picker with next page
+        if reply_lower == "more":
+            # Use adapter's provider pagination helper if available
+            pagination_result = await self._handle_provider_pagination_reply(
+                adapter, pending, platform_str, chat_id_str, sess_key
+            )
+            if pagination_result is None:
+                return True  # picker re-sent async
+            return pagination_result  # error string
+
+        # Handle numeric replies
+        if raw_text.isdigit():
+            selection = int(raw_text)
+
+            # Provider index 0 = "All providers"
+            if selection == 0:
+                # Update state to model step with all providers
+                if key in picker_state._store:
+                    entry = picker_state._store[key]
+                    entry.step = "model"
+                    entry.selected_provider = None
+
+                # Send model picker with all providers
+                metadata = {
+                    "thread_id": source.thread_id
+                } if getattr(source, "thread_id", None) else None
+
+                result = await adapter.send_model_picker(
+                    chat_id=chat_id_str,
+                    providers=pending.providers,
+                    current_model=pending.current_model,
+                    current_provider=pending.current_provider,
+                    session_key=sess_key,
+                    on_model_selected=pending.on_model_selected,
+                    metadata=metadata,
+                    page=0,
+                )
+
+                if not result.success:
+                    return f"Failed to send model picker: {result.error}"
+                return True  # Picker sent; adapter handles the response
+
+            # Selection N = specific provider (1-indexed global index)
+            # Use adapter's provider lookup method
+            provider_slug = await self._resolve_provider_index(
+                adapter, pending.providers, selection
+            )
+
+            if provider_slug is None:
+                # Invalid selection — keep picker alive so the user can retry.
+                total_providers = len(pending.providers)
+                return f"Number out of range. Reply 0–{total_providers} or 'more'."
+
+            # Filter providers to just the selected one
+            filtered_providers = [
+                p for p in pending.providers
+                if p.get("slug") == provider_slug or p.get("name") == provider_slug
+            ]
+
+            if not filtered_providers:
+                return f"Provider '{provider_slug}' not found."
+
+            # Update state to model step with selected provider
+            if key in picker_state._store:
+                entry = picker_state._store[key]
+                entry.step = "model"
+                entry.selected_provider = provider_slug
+
+            # Send model picker with filtered providers
+            metadata = {
+                "thread_id": source.thread_id
+            } if getattr(source, "thread_id", None) else None
+
+            result = await adapter.send_model_picker(
+                chat_id=chat_id_str,
+                providers=filtered_providers,
+                current_model=pending.current_model,
+                current_provider=pending.current_provider,
+                session_key=sess_key,
+                on_model_selected=pending.on_model_selected,
+                metadata=metadata,
+                page=0,
+            )
+
+            if not result.success:
+                return f"Failed to send model picker: {result.error}"
+            return True  # Picker sent; adapter handles the response
+
+        # Unrecognized reply → cancel picker and signal caller to fall through.
+        # This matches the model-step fall-through behaviour so free-form
+        # text reaches the agent instead of being silently swallowed.
+        picker_state.cancel(platform_str, chat_id_str, sess_key)
+        return False
+
+    async def _handle_provider_pagination_reply(
+        self,
+        adapter: Any,
+        pending: Any,
+        platform_str: str,
+        chat_id_str: str,
+        sess_key: str,
+    ) -> Optional[str]:
+        """Handle 'more' reply during provider selection step.
+
+        Increments the current_page and re-sends the provider picker.
+        """
+        picker_state: ModelPickerState = adapter._model_picker_state
+
+        # Get total number of providers for page calculation
+        total_providers = len(pending.providers)
+        max_per_page = getattr(adapter, "_PROVIDER_PAGE_SIZE", 12)
+        total_pages = max(1, (total_providers + max_per_page - 1) // max_per_page)
+
+        # Compute next page; wrap around if past the end
+        new_page = (pending.current_page + 1) % total_pages
+
+        # Update the entry's current_page via the public API
+        picker_state.mark_page(platform_str, chat_id_str, sess_key, new_page)
+
+        # Re-send provider picker with the new page
+        metadata = {
+            "thread_id": adapter._last_source.thread_id
+        } if getattr(adapter, "_last_source", None) and getattr(adapter._last_source, "thread_id", None) else None
+
+        result = await adapter.send_provider_picker(
+            chat_id=chat_id_str,
+            providers=pending.providers,
+            current_model=pending.current_model,
+            current_provider=pending.current_provider,
+            session_key=sess_key,
+            on_provider_selected=pending.on_model_selected,
+            metadata=metadata,
+            page=new_page,
+        )
+
+        if not result.success:
+            return f"Failed to re-send provider picker: {result.error}"
+        return None  # Picker sent; adapter handles the response
+
+    async def _resolve_provider_index(
+        self,
+        adapter: Any,
+        providers: list,
+        index: int,
+    ) -> Optional[str]:
+        """Resolve a 1-indexed provider number to a provider slug.
+
+        Returns the provider slug if found, None if out of range.
+        """
+        # Use adapter's sorting logic if available (Signal has curated order)
+        if hasattr(adapter, "_sort_providers_curated"):
+            sorted_providers = adapter._sort_providers_curated(providers)
+        else:
+            # Default: sort by slug/name
+            sorted_providers = sorted(
+                providers,
+                key=lambda p: p.get("slug", p.get("name", "")).lower()
+            )
+
+        # index is 1-based global index
+        provider_idx = index - 1  # Convert to 0-based
+        if 0 <= provider_idx < len(sorted_providers):
+            provider = sorted_providers[provider_idx]
+            return provider.get("slug", provider.get("name"))
+        return None
 
     async def _handle_provider_command(self, event: MessageEvent) -> str:
         """Handle /provider command - show available providers."""
