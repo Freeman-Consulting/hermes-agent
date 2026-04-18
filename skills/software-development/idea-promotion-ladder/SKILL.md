@@ -1,0 +1,1 @@
+/Users/openclaw/.hermes/skills/software-development/idea-promotion-ladder/SKILL.md
