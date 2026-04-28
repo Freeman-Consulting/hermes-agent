@@ -5,8 +5,8 @@ Provides a FastAPI backend serving the Vite/React frontend and REST API
 endpoints for managing configuration, environment variables, and sessions.
 
 Usage:
-    python -m hermes_cli.main web          # Start on http://127.0.0.1:9119
-    python -m hermes_cli.main web --port 8080
+    python -m hermes_cli.main dashboard          # Start on http://0.0.0.0:9119
+    python -m hermes_cli.main dashboard --port 8080
 """
 
 import asyncio
@@ -3473,10 +3473,10 @@ mount_spa(app)
 
 
 def start_server(
-    host: str = "127.0.0.1",
+    host: str = "0.0.0.0",
     port: int = 9119,
     open_browser: bool = True,
-    allow_public: bool = False,
+    allow_public: bool = True,
     *,
     embedded_chat: bool = False,
 ):
@@ -3495,8 +3495,8 @@ def start_server(
         )
     if host not in _LOCALHOST:
         _log.warning(
-            "Binding to %s with --insecure — the dashboard has no robust "
-            "authentication. Only use on trusted networks.", host,
+            "Binding to %s on all/non-loopback interfaces — only use the "
+            "dashboard on trusted networks such as Tailnet/private LAN.", host,
         )
 
     # Record the bound host so host_header_middleware can validate incoming
