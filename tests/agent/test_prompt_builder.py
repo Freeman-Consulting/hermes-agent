@@ -16,6 +16,7 @@ from agent.prompt_builder import (
     _find_git_root,
     _strip_yaml_frontmatter,
     build_skills_system_prompt,
+    load_soul_md,
     build_nous_subscription_prompt,
     build_context_files_prompt,
     build_environment_hints,
@@ -254,17 +255,25 @@ class TestBuildSkillsSystemPrompt:
         result = build_skills_system_prompt()
         assert result == ""
 
-    def test_builds_index_with_skills(self, monkeypatch, tmp_path):
+    def test_builds_lean_resolver_guidance_instead_of_full_catalog(self, monkeypatch, tmp_path):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
         skills_dir = tmp_path / "skills" / "coding" / "python-debug"
         skills_dir.mkdir(parents=True)
         (skills_dir / "SKILL.md").write_text(
             "---\nname: python-debug\ndescription: Debug Python scripts\n---\n"
         )
-        result = build_skills_system_prompt()
-        assert "python-debug" in result
-        assert "Debug Python scripts" in result
-        assert "available_skills" in result
+        result = build_skills_system_prompt(include_catalog=False)
+        assert "Skills / Resolver" in result
+        assert "RESOLVER.md" in result
+        assert "skills_list" in result
+        assert "<available_skills>" not in result
+        assert "python-debug" not in result
+        assert "Debug Python scripts" not in result
+
+        catalog = build_skills_system_prompt(include_catalog=True)
+        assert "python-debug" in catalog
+        assert "Debug Python scripts" in catalog
+        assert "<available_skills>" in catalog
 
     def test_deduplicates_skills(self, monkeypatch, tmp_path):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
@@ -427,6 +436,37 @@ class TestBuildSkillsSystemPrompt:
 
         result = build_skills_system_prompt()
         assert "backend-skill" in result
+
+
+class TestLeanGerardStartup:
+    def test_load_soul_md_replaces_mandatory_wakeup_with_lean_policy(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        (tmp_path / "SOUL.md").write_text(
+            "# Gerard — SOUL.md + Wake-up Protocol\n\n"
+            "## Mandatory Wake-up Sequence\n"
+            "Before doing anything else in a fresh session, load and read these files.\n"
+            "1. **`~/.hermes/docs/agent-network/2026-04-06-network-topology-policy.md`**\n"
+            "2. **`~/.hermes/docs/projects/global-status.md`**\n\n"
+            "## Identity\n"
+            "You are **Gerard**.\n"
+        )
+
+        result = load_soul_md()
+
+        assert result is not None
+        assert "## Lean startup policy" in result
+        assert "Do not automatically read the full wake-up source docs" in result
+        assert "Use the skill resolver/skill_view path" in result
+        assert "Before doing anything else" not in result
+        assert "## Identity" in result
+        assert "You are **Gerard**" in result
+
+    def test_load_soul_md_leaves_non_gerard_soul_unchanged(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        soul = "# Other Agent\n\n## Mandatory Wake-up Sequence\nRead something.\n\n## Identity\nOther."
+        (tmp_path / "SOUL.md").write_text(soul)
+
+        assert load_soul_md() == soul
 
 
 class TestBuildNousSubscriptionPrompt:

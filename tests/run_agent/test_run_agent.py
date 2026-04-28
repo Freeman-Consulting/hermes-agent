@@ -920,6 +920,7 @@ class TestBuildSystemPrompt:
         assert "SKILLS_PROMPT" in prompt
         assert mock_skills.call_args.kwargs["available_tools"] == set(toolset_map)
         assert mock_skills.call_args.kwargs["available_toolsets"] == {"web", "skills"}
+        assert mock_skills.call_args.kwargs["include_catalog"] is False
 
 
 class TestToolUseEnforcementConfig:

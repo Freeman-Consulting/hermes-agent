@@ -4545,6 +4545,7 @@ class AIAgent:
             skills_prompt = build_skills_system_prompt(
                 available_tools=self.valid_tool_names,
                 available_toolsets=avail_toolsets,
+                include_catalog=False,
             )
         else:
             skills_prompt = ""
