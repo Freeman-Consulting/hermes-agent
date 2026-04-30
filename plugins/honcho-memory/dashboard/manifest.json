@@ -1,0 +1,13 @@
+{
+  "name": "honcho-memory",
+  "label": "Honcho Memory",
+  "description": "Dashboard for Honcho AI-native memory — stats, peer cards, search, and session context",
+  "icon": "Brain",
+  "version": "0.3.0",
+  "tab": {
+    "path": "/honcho-memory",
+    "position": "after:skills"
+  },
+  "entry": "dist/index.js",
+  "api": "plugin_api.py"
+}
