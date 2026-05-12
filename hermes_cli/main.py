@@ -7288,6 +7288,87 @@ def _run_pre_update_backup(args) -> None:
     print()
 
 
+def _apply_update_carried_refs(git_cmd: list, project_root: Path) -> bool:
+    """Apply user-configured local patch refs after updating to upstream main.
+
+    ``hermes update`` intentionally resets/pulls the shared checkout back to
+    ``origin/main``. Aubrey-style local customization branches need one
+    explicit, durable reapply hook so those patches survive future updates.
+    Refs live in config.yaml under ``updates.carried_refs``.
+    """
+    try:
+        from hermes_cli.config import load_config
+
+        cfg = load_config()
+    except Exception as exc:
+        logger.debug("Could not load config for carried update refs: %s", exc)
+        return False
+
+    updates_cfg = cfg.get("updates", {}) if isinstance(cfg, dict) else {}
+    raw_refs = updates_cfg.get("carried_refs") or []
+    if isinstance(raw_refs, str):
+        refs = [raw_refs]
+    elif isinstance(raw_refs, (list, tuple)):
+        refs = [str(r).strip() for r in raw_refs if str(r).strip()]
+    else:
+        refs = []
+
+    if not refs:
+        return False
+
+    print()
+    print("→ Applying carried update refs...")
+
+    fetch_result = subprocess.run(
+        git_cmd + ["fetch", "--all", "--prune"],
+        cwd=project_root,
+        capture_output=True,
+        text=True,
+    )
+    if fetch_result.returncode != 0:
+        print("✗ Failed to fetch refs before applying carried update patches.")
+        if fetch_result.stderr.strip():
+            print(f"  {fetch_result.stderr.strip().splitlines()[0]}")
+        sys.exit(1)
+
+    applied_any = False
+    for ref in refs:
+        print(f"  → {ref}")
+        result = subprocess.run(
+            git_cmd + ["cherry-pick", ref],
+            cwd=project_root,
+            capture_output=True,
+            text=True,
+        )
+        combined = f"{result.stdout}\n{result.stderr}"
+        if result.returncode == 0:
+            applied_any = True
+            print(f"    ✓ applied {ref}")
+            continue
+
+        if "previous cherry-pick is now empty" in combined or "nothing to commit" in combined:
+            subprocess.run(
+                git_cmd + ["cherry-pick", "--abort"],
+                cwd=project_root,
+                capture_output=True,
+                text=True,
+            )
+            print(f"    ✓ already present ({ref})")
+            continue
+
+        print(f"✗ Failed to apply carried ref: {ref}")
+        if result.stderr.strip():
+            print(f"  {result.stderr.strip().splitlines()[0]}")
+        print("  Resolve conflicts, then run:")
+        print("    git cherry-pick --continue")
+        print("  Or abandon the carried patch for this update:")
+        print("    git cherry-pick --abort")
+        sys.exit(1)
+
+    return applied_any
+
+
+
 def cmd_update(args):
     """Update Hermes Agent to the latest version.
 
@@ -7473,6 +7554,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
                     prompt_user=prompt_for_restore,
                     input_fn=gw_input_fn,
                 )
+            _apply_update_carried_refs(git_cmd, PROJECT_ROOT)
             if current_branch not in {"main", "HEAD"}:
                 subprocess.run(
                     git_cmd + ["checkout", current_branch],
@@ -7552,6 +7634,8 @@ def _cmd_update_impl(args, gateway_mode: bool):
                     )
 
         _invalidate_update_cache()
+
+        _apply_update_carried_refs(git_cmd, PROJECT_ROOT)
 
         # Clear stale .pyc bytecode cache — prevents ImportError on gateway
         # restart when updated source references names that didn't exist in

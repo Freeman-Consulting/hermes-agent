@@ -15,6 +15,7 @@ from agent.prompt_builder import (
     _find_hermes_md,
     _find_git_root,
     _strip_yaml_frontmatter,
+    _compact_gerard_soul,
     build_skills_system_prompt,
     build_nous_subscription_prompt,
     build_context_files_prompt,
@@ -48,6 +49,44 @@ class TestGuidanceConstants:
     def test_session_search_guidance_is_simple_cross_session_recall(self):
         assert "relevant cross-session context exists" in SESSION_SEARCH_GUIDANCE
         assert "recent turns of the current session" not in SESSION_SEARCH_GUIDANCE
+
+
+class TestLeanGerardStartup:
+    def test_compact_gerard_soul_replaces_mandatory_wakeup_with_lean_policy(self):
+        content = (
+            "# Gerard\n\n"
+            "## Mandatory Wake-up Sequence\n"
+            "Before doing anything else in a fresh session, load and read these files in this exact order:\n\n"
+            "1. **`~/.hermes/docs/agent-network/2026-04-06-network-topology-policy.md`**\n"
+            "2. **`~/.hermes/docs/projects/global-status.md`**\n\n"
+            "## Identity\n"
+            "You are Gerard.\n"
+        )
+
+        result = _compact_gerard_soul(content)
+
+        assert "## Mandatory Wake-up Sequence" not in result
+        assert "## Lean startup policy" in result
+        assert "Do not automatically read the full wake-up source docs" in result
+        assert "2026-04-06-network-topology-policy.md" in result
+        assert "## Identity" in result
+
+    def test_non_gerard_soul_is_not_compacted(self):
+        content = "# Wren\n\n## Mandatory Wake-up Sequence\nRead something.\n\n## Identity\nYou are Wren."
+
+        assert _compact_gerard_soul(content) == content
+
+    def test_skills_prompt_can_use_lean_resolver_policy(self, tmp_path, monkeypatch):
+        skills_dir = tmp_path / "skills"
+        skills_dir.mkdir()
+        monkeypatch.setattr("agent.prompt_builder.get_skills_dir", lambda: skills_dir)
+        monkeypatch.setattr("agent.prompt_builder.get_all_skills_dirs", lambda: [skills_dir])
+
+        prompt = build_skills_system_prompt(include_catalog=False)
+
+        assert "lean resolver-first policy" in prompt
+        assert "skills_list" in prompt
+        assert "hermes-agent" in prompt
 
 
 # =========================================================================
