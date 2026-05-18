@@ -941,6 +941,80 @@ def _build_snapshot_entry(
 
 
 # =========================================================================
+# Lean startup bootstrap
+# =========================================================================
+
+_STARTUP_SOURCE_DOCS = (
+    (
+        "Agent topology/policy",
+        "docs/agent-network/2026-04-06-network-topology-policy.md",
+    ),
+    (
+        "Agent network handoff",
+        "docs/agent-network/2026-04-05-agent-network-handoff.md",
+    ),
+    (
+        "Model assignment policy",
+        "docs/agent-network/2026-04-05-model-assignment-policy.md",
+    ),
+    (
+        "Global project status",
+        "docs/projects/global-status.md",
+    ),
+)
+
+_LEAN_GERARD_STARTUP_BLOCK = """## Lean startup policy
+
+Default startup is lean. Do not automatically read the full wake-up source docs before routine work.
+
+Authoritative source docs remain on disk:
+{source_docs}
+
+Use the compact rules below first. Load full source docs only when the task requires exact agent topology, routing/model policy, memory policy, cross-project status, or when modifying those policies/docs. For routine tool execution, load only relevant resolver/skill context and act.
+
+### Gerard bootstrap
+- Identity: Gerard is Aubrey's chief of staff, single front door, orchestrator, and senior operator.
+- Style: sharp, direct, calm, low-noise; no customer-service fluff; no permission-slip endings.
+- Default loop: classify -> retrieve only needed context -> route/execute -> verify -> report.
+- Routing: Ops Center -> Sloane; personal/dev/hermes-agent -> Wren; hockey -> Coach; Azure -> Vega; bounded recon -> Barry/Yocal; mixed/strategic -> Gerard.
+- Memory: Honcho/user profile for Aubrey preferences; local memory for environment facts; skills for workflows; session_search for transient history.
+- Model policy summary: default cheap/local/general; coding lane for implementation/debugging/tests; premium only for hard reasoning, ugly failures, or high-stakes review.
+
+### Skill resolver policy
+Use the skill resolver/skill_view path instead of carrying the full skill catalog in the system prompt. If resolver hints identify relevant skills, load them before acting. If no hint appears but the task is clearly specialized, use skills_list/skill_view selectively.
+"""
+
+_WAKEUP_SECTION_RE = re.compile(
+    r"## Mandatory Wake-up Sequence\n.*?(?=\n## Identity\n)",
+    re.DOTALL,
+)
+
+
+def _format_startup_source_docs() -> str:
+    hermes_home = get_hermes_home()
+    lines = []
+    for label, rel_path in _STARTUP_SOURCE_DOCS:
+        path = hermes_home / rel_path
+        marker = "exists" if path.exists() else "missing"
+        lines.append(f"- {label}: `{path}` ({marker})")
+    return "\n".join(lines)
+
+
+def _compact_gerard_soul(content: str) -> str:
+    """Replace Gerard's verbose mandatory wake-up block with lean retrieval policy."""
+    if "# Gerard" not in content or "## Mandatory Wake-up Sequence" not in content:
+        return content
+
+    replacement = _LEAN_GERARD_STARTUP_BLOCK.format(
+        source_docs=_format_startup_source_docs()
+    )
+    compacted, count = _WAKEUP_SECTION_RE.subn(replacement + "\n", content, count=1)
+    if count == 0:
+        return content
+    return compacted
+
+
+# =========================================================================
 # Skills index
 # =========================================================================
 
@@ -997,6 +1071,7 @@ def _skill_should_show(
 def build_skills_system_prompt(
     available_tools: "set[str] | None" = None,
     available_toolsets: "set[str] | None" = None,
+    include_catalog: bool = True,
 ) -> str:
     """Build a compact skill index for the system prompt.
 
@@ -1017,6 +1092,26 @@ def build_skills_system_prompt(
 
     if not skills_dir.exists() and not external_dirs:
         return ""
+
+    if not include_catalog:
+        return (
+            "## Skills (mandatory)\n"
+            "Before replying, decide whether the user's task matches any installed skill. "
+            "Do not rely on a preloaded full skill catalog; routine startup intentionally "
+            "uses a lean resolver-first policy to keep the initial prompt small.\n"
+            "Use `skills_list` to inspect available skills when the task domain is unclear, "
+            "and load matched skills with `skill_view(name)` before doing specialized work. "
+            "Follow loaded skill instructions, including their verification and maintenance "
+            "requirements.\n"
+            "Resolver source: `~/.hermes/skills/RESOLVER.md` plus profile-specific "
+            "`skills/RESOLVER.md` where present. The full skill catalog remains available "
+            "by calling build_skills_system_prompt(include_catalog=True) in tests/debugging "
+            "or by using skills tools at runtime.\n"
+            "Whenever the user asks you to configure, set up, install, enable, disable, modify, "
+            "or troubleshoot Hermes Agent itself — its CLI, config, models, providers, tools, "
+            "skills, voice, gateway, plugins, or any feature — load the `hermes-agent` skill first.\n"
+            "If a skill is outdated, incomplete, or wrong, patch it with skill_manage before finishing."
+        )
 
     # ── Layer 1: in-process LRU cache ─────────────────────────────────
     # Include the resolved platform so per-platform disabled-skill lists
@@ -1331,6 +1426,7 @@ def load_soul_md() -> Optional[str]:
         if not content:
             return None
         content = _scan_context_content(content, "SOUL.md")
+        content = _compact_gerard_soul(content)
         content = _truncate_content(content, "SOUL.md")
         return content
     except Exception as e:

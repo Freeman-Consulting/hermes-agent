@@ -32,6 +32,8 @@ def test_stash_local_changes_if_needed_returns_specific_stash_commit(monkeypatch
         calls.append((cmd, kwargs))
         if cmd[-2:] == ["status", "--porcelain"]:
             return SimpleNamespace(stdout=" M hermes_cli/main.py\n?? notes.txt\n", returncode=0)
+        if cmd[-2:] == ["diff", "--name-only"]:
+            return SimpleNamespace(stdout="hermes_cli/main.py\n", returncode=0)
         if cmd[-2:] == ["ls-files", "--unmerged"]:
             return SimpleNamespace(stdout="", returncode=0)
         if cmd[1:4] == ["stash", "push", "--include-untracked"]:
@@ -45,9 +47,33 @@ def test_stash_local_changes_if_needed_returns_specific_stash_commit(monkeypatch
     stash_ref = hermes_main._stash_local_changes_if_needed(["git"], tmp_path)
 
     assert stash_ref == "abc123"
-    assert calls[1][0][-2:] == ["ls-files", "--unmerged"]
-    assert calls[2][0][1:4] == ["stash", "push", "--include-untracked"]
-    assert calls[3][0][-3:] == ["rev-parse", "--verify", "refs/stash"]
+    assert calls[1][0][-2:] == ["diff", "--name-only"]
+    assert calls[2][0][-2:] == ["ls-files", "--unmerged"]
+    assert calls[3][0][1:4] == ["stash", "push", "--include-untracked"]
+    assert calls[4][0][-3:] == ["rev-parse", "--verify", "refs/stash"]
+
+
+
+
+def test_stash_local_changes_if_needed_refuses_conflict_markers(monkeypatch, tmp_path, capsys):
+    dirty = tmp_path / "run_agent.py"
+    dirty.write_text("def ok():\n<<<<<<< HEAD\n    pass\n=======\n    return None\n>>>>>>> branch\n")
+
+    def fake_run(cmd, **kwargs):
+        if cmd[-2:] == ["status", "--porcelain"]:
+            return SimpleNamespace(stdout=" M run_agent.py\n", returncode=0)
+        if cmd[-2:] == ["diff", "--name-only"]:
+            return SimpleNamespace(stdout="run_agent.py\n", returncode=0)
+        raise AssertionError(f"unexpected command: {cmd}")
+
+    monkeypatch.setattr(hermes_main.subprocess, "run", fake_run)
+
+    with pytest.raises(SystemExit, match="1"):
+        hermes_main._stash_local_changes_if_needed(["git"], tmp_path)
+
+    out = capsys.readouterr().out
+    assert "Refusing to stash" in out
+    assert "run_agent.py" in out
 
 
 def test_resolve_stash_selector_returns_matching_entry(monkeypatch, tmp_path):
@@ -289,6 +315,84 @@ def test_stash_local_changes_if_needed_raises_when_stash_ref_missing(monkeypatch
 
     with pytest.raises(CalledProcessError):
         hermes_main._stash_local_changes_if_needed(["git"], Path(tmp_path))
+
+
+# ---------------------------------------------------------------------------
+# Carried refs — local patches that must survive hermes update
+# ---------------------------------------------------------------------------
+
+
+def test_apply_update_carried_refs_noops_when_unconfigured(monkeypatch, tmp_path):
+    calls = []
+    monkeypatch.setattr(hermes_config, "load_config", lambda: {"updates": {}})
+
+    def fake_run(cmd, **kwargs):
+        calls.append((cmd, kwargs))
+        raise AssertionError(f"unexpected command: {cmd}")
+
+    monkeypatch.setattr(hermes_main.subprocess, "run", fake_run)
+
+    assert hermes_main._apply_update_carried_refs(["git"], tmp_path) is False
+    assert calls == []
+
+
+
+def test_apply_update_carried_refs_cherry_picks_configured_refs(monkeypatch, tmp_path, capsys):
+    recorded = []
+    monkeypatch.setattr(
+        hermes_config,
+        "load_config",
+        lambda: {"updates": {"carried_refs": ["fork/aubrey/lean-startup-sticky"]}},
+    )
+
+    def fake_run(cmd, **kwargs):
+        recorded.append(cmd)
+        if cmd == ["git", "fetch", "--all", "--prune"]:
+            return SimpleNamespace(stdout="", stderr="", returncode=0)
+        if cmd == ["git", "cherry-pick", "fork/aubrey/lean-startup-sticky"]:
+            return SimpleNamespace(stdout="[main abc123] carried\n", stderr="", returncode=0)
+        raise AssertionError(f"unexpected command: {cmd}")
+
+    monkeypatch.setattr(hermes_main.subprocess, "run", fake_run)
+
+    assert hermes_main._apply_update_carried_refs(["git"], tmp_path) is True
+    assert recorded == [
+        ["git", "fetch", "--all", "--prune"],
+        ["git", "cherry-pick", "fork/aubrey/lean-startup-sticky"],
+    ]
+    out = capsys.readouterr().out
+    assert "Applying carried update refs" in out
+    assert "fork/aubrey/lean-startup-sticky" in out
+
+
+
+def test_apply_update_carried_refs_stops_loudly_on_conflict(monkeypatch, tmp_path, capsys):
+    monkeypatch.setattr(
+        hermes_config,
+        "load_config",
+        lambda: {"updates": {"carried_refs": ["fork/aubrey/lean-startup-sticky"]}},
+    )
+
+    def fake_run(cmd, **kwargs):
+        if cmd == ["git", "fetch", "--all", "--prune"]:
+            return SimpleNamespace(stdout="", stderr="", returncode=0)
+        if cmd == ["git", "cherry-pick", "fork/aubrey/lean-startup-sticky"]:
+            return SimpleNamespace(
+                stdout="",
+                stderr="CONFLICT (content): Merge conflict in agent/prompt_builder.py\n",
+                returncode=1,
+            )
+        raise AssertionError(f"unexpected command: {cmd}")
+
+    monkeypatch.setattr(hermes_main.subprocess, "run", fake_run)
+
+    with pytest.raises(SystemExit, match="1"):
+        hermes_main._apply_update_carried_refs(["git"], tmp_path)
+
+    out = capsys.readouterr().out
+    assert "Failed to apply carried ref" in out
+    assert "git cherry-pick --continue" in out
+    assert "git cherry-pick --abort" in out
 
 
 # ---------------------------------------------------------------------------

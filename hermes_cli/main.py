@@ -6820,6 +6820,40 @@ def _update_via_zip(args):
     _kill_stale_dashboard_processes()
 
 
+def _working_tree_has_conflict_markers(git_cmd: list[str], cwd: Path) -> list[str]:
+    """Return tracked text files that contain unresolved git conflict markers.
+
+    This is deliberately conservative and runs before `git stash push`. If a
+    previous failed update left literal conflict markers in a file but the index
+    is no longer unmerged, stashing that dirty tree preserves the poison and a
+    later update can reapply syntax-breaking source.
+    """
+    try:
+        files = subprocess.run(
+            git_cmd + ["diff", "--name-only"],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.splitlines()
+    except Exception:
+        return []
+
+    poisoned: list[str] = []
+    marker_prefixes = ("<<<<<<< ", "||||||| ", "=======", ">>>>>>> ")
+    for rel in files:
+        path = cwd / rel
+        try:
+            with path.open("r", encoding="utf-8") as fh:
+                for line in fh:
+                    if line.startswith(marker_prefixes):
+                        poisoned.append(rel)
+                        break
+        except (OSError, UnicodeDecodeError):
+            continue
+    return poisoned
+
+
 def _stash_local_changes_if_needed(git_cmd: list[str], cwd: Path) -> Optional[str]:
     status = subprocess.run(
         git_cmd + ["status", "--porcelain"],
@@ -6830,6 +6864,15 @@ def _stash_local_changes_if_needed(git_cmd: list[str], cwd: Path) -> Optional[st
     )
     if not status.stdout.strip():
         return None
+
+    poisoned_files = _working_tree_has_conflict_markers(git_cmd, cwd)
+    if poisoned_files:
+        print("✗ Local changes contain unresolved conflict markers.")
+        print("  Refusing to stash them because a future update would reapply broken source.")
+        print("  Resolve or discard these files, then rerun `hermes update`:")
+        for rel in poisoned_files:
+            print(f"    • {rel}")
+        sys.exit(1)
 
     # If the index has unmerged entries (e.g. from an interrupted merge/rebase),
     # git stash will fail with "needs merge / could not write index".  Clear the
@@ -8311,6 +8354,87 @@ def _run_pre_update_backup(args) -> None:
     print()
 
 
+def _apply_update_carried_refs(git_cmd: list, project_root: Path) -> bool:
+    """Apply user-configured local patch refs after updating to upstream main.
+
+    ``hermes update`` intentionally resets/pulls the shared checkout back to
+    ``origin/main``. Aubrey-style local customization branches need one
+    explicit, durable reapply hook so those patches survive future updates.
+    Refs live in config.yaml under ``updates.carried_refs``.
+    """
+    try:
+        from hermes_cli.config import load_config
+
+        cfg = load_config()
+    except Exception as exc:
+        logger.debug("Could not load config for carried update refs: %s", exc)
+        return False
+
+    updates_cfg = cfg.get("updates", {}) if isinstance(cfg, dict) else {}
+    raw_refs = updates_cfg.get("carried_refs") or []
+    if isinstance(raw_refs, str):
+        refs = [raw_refs]
+    elif isinstance(raw_refs, (list, tuple)):
+        refs = [str(r).strip() for r in raw_refs if str(r).strip()]
+    else:
+        refs = []
+
+    if not refs:
+        return False
+
+    print()
+    print("→ Applying carried update refs...")
+
+    fetch_result = subprocess.run(
+        git_cmd + ["fetch", "--all", "--prune"],
+        cwd=project_root,
+        capture_output=True,
+        text=True,
+    )
+    if fetch_result.returncode != 0:
+        print("✗ Failed to fetch refs before applying carried update patches.")
+        if fetch_result.stderr.strip():
+            print(f"  {fetch_result.stderr.strip().splitlines()[0]}")
+        sys.exit(1)
+
+    applied_any = False
+    for ref in refs:
+        print(f"  → {ref}")
+        result = subprocess.run(
+            git_cmd + ["cherry-pick", ref],
+            cwd=project_root,
+            capture_output=True,
+            text=True,
+        )
+        combined = f"{result.stdout}\n{result.stderr}"
+        if result.returncode == 0:
+            applied_any = True
+            print(f"    ✓ applied {ref}")
+            continue
+
+        if "previous cherry-pick is now empty" in combined or "nothing to commit" in combined:
+            subprocess.run(
+                git_cmd + ["cherry-pick", "--abort"],
+                cwd=project_root,
+                capture_output=True,
+                text=True,
+            )
+            print(f"    ✓ already present ({ref})")
+            continue
+
+        print(f"✗ Failed to apply carried ref: {ref}")
+        if result.stderr.strip():
+            print(f"  {result.stderr.strip().splitlines()[0]}")
+        print("  Resolve conflicts, then run:")
+        print("    git cherry-pick --continue")
+        print("  Or abandon the carried patch for this update:")
+        print("    git cherry-pick --abort")
+        sys.exit(1)
+
+    return applied_any
+
+
+
 def cmd_update(args):
     """Update Hermes Agent to the latest version.
 
@@ -8527,6 +8651,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
         if commit_count == 0:
             _invalidate_update_cache()
             # Restore stash and switch back to original branch if we moved
+            _apply_update_carried_refs(git_cmd, PROJECT_ROOT)
             if auto_stash_ref is not None:
                 _restore_stashed_changes(
                     git_cmd,
@@ -8644,24 +8769,30 @@ def _cmd_update_impl(args, gateway_mode: bool):
 
             update_succeeded = True
         finally:
-            if auto_stash_ref is not None:
+            if auto_stash_ref is not None and not update_succeeded:
                 # Don't attempt stash restore if the code update itself failed —
                 # working tree is in an unknown state.
-                if not update_succeeded:
-                    print(
-                        f"  ℹ️  Local changes preserved in stash (ref: {auto_stash_ref})"
-                    )
-                    print(f"  Restore manually with: git stash apply")
-                else:
-                    _restore_stashed_changes(
-                        git_cmd,
-                        PROJECT_ROOT,
-                        auto_stash_ref,
-                        prompt_user=prompt_for_restore,
-                        input_fn=gw_input_fn,
-                    )
+                print(
+                    f"  ℹ️  Local changes preserved in stash (ref: {auto_stash_ref})"
+                )
+                print(f"  Restore manually with: git stash apply")
 
         _invalidate_update_cache()
+
+        # Reapply durable carried patches while the post-update tree is still
+        # clean. Restoring an autostash first can make the carried cherry-pick
+        # conflict with the same local customization already present in the
+        # working tree.
+        _apply_update_carried_refs(git_cmd, PROJECT_ROOT)
+
+        if auto_stash_ref is not None:
+            _restore_stashed_changes(
+                git_cmd,
+                PROJECT_ROOT,
+                auto_stash_ref,
+                prompt_user=prompt_for_restore,
+                input_fn=gw_input_fn,
+            )
 
         # Clear stale .pyc bytecode cache — prevents ImportError on gateway
         # restart when updated source references names that didn't exist in
