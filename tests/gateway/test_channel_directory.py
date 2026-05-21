@@ -70,6 +70,30 @@ class TestBuildChannelDirectoryWrites:
 
         assert result == previous
 
+    def test_builds_signal_groups_from_adapter_rpc(self, tmp_path):
+        signal_adapter = SimpleNamespace(
+            _rpc=AsyncMock(return_value=[
+                {"id": "abc123", "name": "Hermes — Ops Center", "isMember": True},
+                {"id": "old456", "name": "Old Group", "isMember": False},
+                {"id": "noname", "name": "", "isMember": True},
+            ]),
+            account="test-account",
+        )
+
+        from gateway.config import Platform
+
+        with patch("gateway.channel_directory.DIRECTORY_PATH", tmp_path / "channel_directory.json"):
+            directory = asyncio.run(build_channel_directory({Platform.SIGNAL: signal_adapter}))
+
+        assert directory["platforms"]["signal"] == [
+            {"id": "group:abc123", "name": "Hermes — Ops Center", "type": "group"}
+        ]
+        signal_adapter._rpc.assert_awaited_once_with(
+            "listGroups",
+            {"account": "test-account"},
+            timeout=30.0,
+        )
+
 
 class TestResolveChannelName:
     def _setup(self, tmp_path, platforms):

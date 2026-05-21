@@ -384,11 +384,14 @@ def _parse_target_ref(platform_name: str, target_ref: str):
             return f"group:{target_ref.strip()}", None, True
         return None, None, False
     if platform_name in _PHONE_PLATFORMS:
+        trimmed = target_ref.strip()
+        if platform_name == "signal" and trimmed.startswith("group:") and len(trimmed) > len("group:"):
+            return trimmed, None, True
         match = _E164_TARGET_RE.fullmatch(target_ref)
         if match:
             # Preserve the leading '+' — signal-cli and sms/whatsapp adapters
             # expect E.164 format for direct recipients.
-            return target_ref.strip(), None, True
+            return trimmed, None, True
     if target_ref.lstrip("-").isdigit():
         return target_ref, None, True
     # Matrix room IDs (start with !) and user IDs (start with @) are explicit

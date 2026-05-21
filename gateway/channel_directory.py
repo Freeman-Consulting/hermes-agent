@@ -73,6 +73,8 @@ async def build_channel_directory(adapters: Dict[Any, Any]) -> Dict[str, Any]:
                 platforms["discord"] = _build_discord(adapter)
             elif platform == Platform.SLACK:
                 platforms["slack"] = await _build_slack(adapter)
+            elif platform == Platform.SIGNAL:
+                platforms["signal"] = await _build_signal(adapter)
         except Exception as e:
             logger.warning("Channel directory: failed to build %s: %s", platform.value, e)
 
@@ -143,6 +145,38 @@ def _build_discord(adapter) -> List[Dict[str, str]]:
 
     # Merge any DMs from session history
     channels.extend(_build_from_sessions("discord"))
+    return channels
+
+
+async def _build_signal(adapter) -> List[Dict[str, str]]:
+    """List Signal groups known to signal-cli and make them sendable targets."""
+    groups_rpc = getattr(adapter, "_rpc", None)
+    account = getattr(adapter, "account", "")
+    if not groups_rpc or not account:
+        return _build_from_sessions("signal")
+
+    channels: List[Dict[str, str]] = []
+    seen_ids: set = set()
+    groups = await groups_rpc("listGroups", {"account": account}, timeout=30.0)
+    if isinstance(groups, list):
+        for group in groups:
+            if not isinstance(group, dict) or not group.get("isMember", True):
+                continue
+            group_id = group.get("id")
+            name = group.get("name")
+            if not group_id or not name:
+                continue
+            target_id = f"group:{group_id}"
+            if target_id in seen_ids:
+                continue
+            seen_ids.add(target_id)
+            channels.append({"id": target_id, "name": name, "type": "group"})
+
+    for entry in _build_from_sessions("signal"):
+        if entry.get("id") not in seen_ids:
+            channels.append(entry)
+            seen_ids.add(entry.get("id"))
+
     return channels
 
 
