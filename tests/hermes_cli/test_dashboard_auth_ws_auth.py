@@ -199,7 +199,7 @@ def _fake_ws(*, query: dict, client_host: str = "127.0.0.1", path: str = "/api/p
 
 
 class TestWsAuthOkLoopback:
-    """Gate OFF — legacy token path."""
+    """Gate OFF — legacy token path plus audience-bound mobile tickets."""
 
     def test_correct_token_accepted(self, loopback_app):
         ws = _fake_ws(query={"token": web_server._SESSION_TOKEN})
@@ -213,11 +213,14 @@ class TestWsAuthOkLoopback:
         ws = _fake_ws(query={})
         assert web_server._ws_auth_ok(ws) is False
 
-    def test_ticket_param_ignored_in_loopback(self, loopback_app):
-        # Even if someone sneaks a ticket through, loopback mode only
-        # cares about ?token=. A naked ticket isn't a token.
-        ticket = mint_ticket(user_id="u1", provider="stub")
-        ws = _fake_ws(query={"ticket": ticket})
+    def test_mobile_ticket_accepted_for_api_ws_in_loopback(self, loopback_app):
+        ticket = mint_ticket(user_id="mobile:ios_1", provider="mobile-device", audience="/api/ws")
+        ws = _fake_ws(query={"ticket": ticket}, path="/api/ws")
+        assert web_server._ws_auth_ok(ws) is True
+
+    def test_mobile_ticket_rejected_for_pty_in_loopback(self, loopback_app):
+        ticket = mint_ticket(user_id="mobile:ios_1", provider="mobile-device", audience="/api/ws")
+        ws = _fake_ws(query={"ticket": ticket}, path="/api/pty")
         assert web_server._ws_auth_ok(ws) is False
 
 
