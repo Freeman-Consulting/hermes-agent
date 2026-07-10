@@ -889,6 +889,20 @@ class WhatsAppOnboardingApply(BaseModel):
     profile: Optional[str] = None
 
 
+class MobilePairingCodeRequest(BaseModel):
+    device_name: Optional[str] = None
+
+
+class MobilePairRequest(BaseModel):
+    code: str
+    device_name: Optional[str] = None
+
+
+class MobileWsTicketRequest(BaseModel):
+    device_id: str
+    device_secret: str
+
+
 class AudioTranscriptionRequest(BaseModel):
     data_url: str
     mime_type: Optional[str] = None
@@ -2397,6 +2411,71 @@ async def git_worktree_remove_route(body: GitWorktreeRemoveBody):
 @app.post("/api/git/branch/switch")
 async def git_branch_switch_route(body: GitBranchSwitchBody):
     return await _git_op(_web_git.branch_switch, _git_path(body.path), body.branch)
+
+
+@app.post("/api/mobile/pairing-codes")
+async def create_mobile_pairing_code(request: Request, body: MobilePairingCodeRequest):
+    """Create a one-time pairing code for Hermes Pocket.
+
+    This route is dashboard-authenticated by the normal `/api/` gate. The
+    returned code is intentionally short-lived and is the only value an operator
+    types into the phone. It is not a reusable Gateway credential.
+    """
+    _require_token(request)
+    from hermes_cli.dashboard_auth.mobile_devices import create_pairing_code
+
+    pairing = create_pairing_code(device_name=body.device_name)
+    return {
+        "code": pairing.code,
+        "expires_at": pairing.expires_at,
+        "ttl_seconds": pairing.ttl_seconds,
+        "device_name": pairing.device_name,
+    }
+
+
+@app.post("/api/mobile/pair")
+async def complete_mobile_pairing(body: MobilePairRequest):
+    """Redeem a one-time pairing code and return the device secret once."""
+    from hermes_cli.dashboard_auth.mobile_devices import (
+        PairingCodeInvalid,
+        complete_pairing,
+    )
+
+    try:
+        credential = complete_pairing(code=body.code, device_name=body.device_name)
+    except PairingCodeInvalid:
+        raise HTTPException(status_code=401, detail="Invalid or expired pairing code")
+    return {
+        "device_id": credential.device_id,
+        "device_secret": credential.device_secret,
+        "device_name": credential.device_name,
+        "created_at": credential.created_at,
+    }
+
+
+@app.post("/api/mobile/ws-ticket")
+async def mobile_ws_ticket(body: MobileWsTicketRequest):
+    """Mint a short-lived `/api/ws` ticket from a paired mobile device secret."""
+    from hermes_cli.dashboard_auth.mobile_devices import (
+        DeviceAuthInvalid,
+        verify_device,
+    )
+    from hermes_cli.dashboard_auth.ws_tickets import TTL_SECONDS, mint_ticket
+
+    try:
+        principal = verify_device(
+            device_id=body.device_id,
+            device_secret=body.device_secret,
+        )
+    except DeviceAuthInvalid:
+        raise HTTPException(status_code=401, detail="Invalid device credential")
+
+    ticket = mint_ticket(
+        user_id=principal.user_id,
+        provider=principal.provider,
+        audience="/api/ws",
+    )
+    return {"ticket": ticket, "ttl_seconds": TTL_SECONDS}
 
 
 # Host TCP ports each port-binding gateway platform listens on, as
@@ -14429,26 +14508,16 @@ def _ws_auth_reason(ws: "WebSocket") -> tuple[Optional[str], str]:
     ``internal``, ``token``, or ``none``) so the accepted path can log *how*
     a peer authed, not just that it did.
 
-    Loopback / ``--insecure``: legacy ``?token=<_SESSION_TOKEN>`` query
-    parameter, constant-time compared.
-
-    Gated (public bind, no ``--insecure``): one of two credentials —
-
-    * ``?ticket=<single-use>`` — a browser-minted, single-use, 30s-TTL ticket
-      consumed against the dashboard-auth ticket store. This is what the SPA
-      (and native clients) use.
-    * ``?internal=<process-credential>`` — the process-lifetime internal
-      credential, used only by WS clients the server spawns itself (the
-      embedded-TUI PTY child attaching to ``/api/ws`` and ``/api/pub``). It
-      is multi-use and never expires so the child can reconnect, and is never
-      injected into the SPA — see ``dashboard_auth.ws_tickets`` for the
-      threat model.
+    Loopback / ``--insecure`` accepts the legacy session token and
+    audience-bound mobile tickets. Gated mode accepts browser/mobile tickets
+    plus the process-lifetime internal credential used by server-spawned
+    children. Mobile tickets are bound to ``/api/ws`` by the ticket store.
 
     The legacy ``?token=`` path is unconditionally rejected in gated mode
     (the SPA bundle isn't carrying the token any longer, and a leaked
     ``_SESSION_TOKEN`` must not grant WS access once the gate is engaged).
 
-    Audit-logs the rejection so operators can debug "WS keeps closing"
+    Audit-logs ticket rejection so operators can debug "WS keeps closing"
     issues from the log.
     """
     auth_required = bool(getattr(app.state, "auth_required", False))
@@ -14478,13 +14547,14 @@ def _ws_auth_reason(ws: "WebSocket") -> tuple[Optional[str], str]:
                     path=ws.url.path,
                 )
                 return "internal_invalid", "internal"
+    else:
+        from hermes_cli.dashboard_auth.audit import AuditEvent, audit_log
+        from hermes_cli.dashboard_auth.ws_tickets import TicketInvalid, consume_ticket
 
-        ticket = ws.query_params.get("ticket", "")
-        if not ticket:
-            return "no_credential", "none"
-
+    ticket = ws.query_params.get("ticket", "")
+    if ticket:
         try:
-            consume_ticket(ticket)
+            consume_ticket(ticket, audience=ws.url.path)
             return None, "ticket"
         except TicketInvalid as exc:
             audit_log(
@@ -14494,6 +14564,9 @@ def _ws_auth_reason(ws: "WebSocket") -> tuple[Optional[str], str]:
                 path=ws.url.path,
             )
             return "ticket_invalid", "ticket"
+
+    if auth_required:
+        return "no_credential", "none"
 
     token = ws.query_params.get("token", "")
     if not token:

@@ -59,12 +59,17 @@ class TicketInvalid(Exception):
     """Ticket missing, expired, or already consumed."""
 
 
-def mint_ticket(*, user_id: str, provider: str) -> str:
+def mint_ticket(*, user_id: str, provider: str, audience: Optional[str] = None) -> str:
     """Generate a one-shot ticket bound to this user identity.
 
     The returned token is base64url, 43 bytes of entropy (32-byte random
     seed). Stash returns the ``info`` dict to the caller on consume so the
     WS handler can carry the identity forward into its session log.
+
+    ``audience`` optionally narrows where the ticket can be consumed. Browser
+    session tickets omit it and remain valid for the dashboard WS family;
+    mobile-device tickets set ``audience="/api/ws"`` so a phone credential
+    cannot mint a ticket for PTY/console/event sockets.
     """
     ticket = secrets.token_urlsafe(32)
     info = {
@@ -72,18 +77,22 @@ def mint_ticket(*, user_id: str, provider: str) -> str:
         "provider": provider,
         "minted_at": int(time.time()),
     }
+    if audience:
+        info["audience"] = audience
     with _lock:
         _tickets[ticket] = (int(time.time()) + TTL_SECONDS, info)
         _gc_expired_locked()
     return ticket
 
 
-def consume_ticket(ticket: str) -> Dict[str, Any]:
+def consume_ticket(ticket: str, *, audience: Optional[str] = None) -> Dict[str, Any]:
     """Validate and consume. Raises :class:`TicketInvalid` on missing/expired/used.
 
     Single-use semantics: a successful consume immediately removes the
     ticket from the store, so a second call with the same value raises
-    ``TicketInvalid("unknown ticket: …")``.
+    ``TicketInvalid("unknown ticket: …")``. Audience mismatches also consume
+    the ticket; presenting a ticket to the wrong WS endpoint should not leave
+    it reusable.
     """
     now = int(time.time())
     with _lock:
@@ -96,6 +105,9 @@ def consume_ticket(ticket: str) -> Dict[str, Any]:
         expires_at, info = entry
         if expires_at < now:
             raise TicketInvalid("expired")
+        expected_audience = info.get("audience")
+        if audience and expected_audience and expected_audience != audience:
+            raise TicketInvalid("audience mismatch")
         return info
 
 
