@@ -23,12 +23,21 @@ from typing import Any
 _log = logging.getLogger(__name__)
 _write_lock = threading.Lock()
 
-# Field names that must never appear in the log raw. Any kwarg matching
-# these is silently dropped.
-_REDACTED_FIELDS: frozenset = frozenset({
-    "access_token", "refresh_token", "code", "code_verifier",
-    "state", "ticket", "cookie", "Authorization", "authorization",
-})
+# Canonical field-name stems that must never appear in the log raw.
+# Matching is case-insensitive. Includes both hyphen and underscore
+# variants where relevant (e.g., 'set_cookie' and 'set-cookie').
+# Includes mobile secret-bearing names so defence remains effective
+# even if a caller accidentally supplies one.
+_REDACTED_STEMS: frozenset = frozenset({
+     "access_token", "refresh_token", "refreshtoken",
+     "code", "code_verifier", "codeverifier",
+     "state", "ticket", "cookie", "authorization",
+     # Mobile secret-bearing fields (both snake_case and camelCase forms)
+     "pairing_code", "pairingcode", "device_secret", "devicesecret",
+     "secret_sha256", "raw_ticket", "rawticket",
+     "secret_hash", "set_cookie",
+     "auth_value", "authheader",
+ })
 
 
 class AuditEvent(enum.Enum):
@@ -54,6 +63,17 @@ class AuditEvent(enum.Enum):
     NATIVE_CODE_ISSUED = "native_code_issued"
     NATIVE_TOKEN_SUCCESS = "native_token_success"
     NATIVE_TOKEN_FAILURE = "native_token_failure"
+    # Mobile security events (Phase 4)
+    MOBILE_PAIRING_CODE_CREATED = "mobile_pairing_code_created"
+    MOBILE_PAIRING_REDEEMED = "mobile_pairing_redeemed"
+    MOBILE_PAIRING_REJECTED = "mobile_pairing_rejected"
+    MOBILE_TICKET_MINTED = "mobile_ticket_minted"
+    MOBILE_TICKET_MINT_REJECTED = "mobile_ticket_mint_rejected"
+    MOBILE_WS_ACCEPTED = "mobile_ws_accepted"
+    MOBILE_DEVICE_REVOKED = "mobile_device_revoked"
+    MOBILE_CREDENTIAL_ROTATED = "mobile_credential_rotated"
+    MOBILE_CREDENTIAL_ROTATION_REJECTED = "mobile_credential_rotation_rejected"
+    MOBILE_RATE_LIMIT_REJECTED = "mobile_rate_limit_rejected"
 
 
 def _resolve_log_path() -> Path:
@@ -67,6 +87,16 @@ def _resolve_log_path() -> Path:
     return Path(home) / "logs" / "dashboard-auth.log"
 
 
+def _normalize_field_name(name: str) -> str:
+    """Canonicalise a field name for redaction matching.
+
+    Lowercase and replace hyphens with underscores so that
+    'Authorization', 'SET-COOKIE', 'deviceSecret' all map to their
+    canonical stems before comparison.
+    """
+    return name.lower().replace("-", "_")
+
+
 def audit_log(event: AuditEvent, **fields: Any) -> None:
     """Append one event to the audit log.
 
@@ -76,7 +106,7 @@ def audit_log(event: AuditEvent, **fields: Any) -> None:
     """
     safe_fields = {
         k: v for k, v in fields.items()
-        if k not in _REDACTED_FIELDS
+        if _normalize_field_name(k) not in _REDACTED_STEMS
     }
     entry = {
         "ts": _dt.datetime.now(_dt.timezone.utc).isoformat(),
@@ -92,3 +122,14 @@ def audit_log(event: AuditEvent, **fields: Any) -> None:
                 f.write(line)
     except Exception as e:
         _log.warning("dashboard-auth audit log write failed: %s", e)
+
+
+def ticket_fingerprint(ticket: str) -> str:
+    """One-way SHA-256-derived fingerprint for a ticket value.
+
+    Returns the first 16 hex characters of the SHA-256 hash — a short
+    deterministic identifier that can be logged to correlate mint and
+    acceptance events without exposing the raw ticket.
+    """
+    import hashlib
+    return hashlib.sha256(ticket.encode("utf-8")).hexdigest()[:16]

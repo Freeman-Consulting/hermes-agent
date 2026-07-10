@@ -2971,9 +2971,15 @@ async def create_mobile_pairing_code(request: Request, body: MobilePairingCodeRe
     types into the phone. It is not a reusable Gateway credential.
     """
     _require_token(request)
+    from hermes_cli.dashboard_auth.audit import audit_log, AuditEvent
     from hermes_cli.dashboard_auth.mobile_devices import create_pairing_code
 
     pairing = create_pairing_code(device_name=body.device_name)
+    audit_log(
+        AuditEvent.MOBILE_PAIRING_CODE_CREATED,
+        device_name=pairing.device_name,
+        ip=request.client.host if request.client else "",
+    )
     return {
         "code": pairing.code,
         "expires_at": pairing.expires_at,
@@ -2985,6 +2991,7 @@ async def create_mobile_pairing_code(request: Request, body: MobilePairingCodeRe
 @app.post("/api/mobile/pair")
 async def complete_mobile_pairing(request: Request, body: MobilePairRequest):
     """Redeem a one-time pairing code and return the device secret once."""
+    from hermes_cli.dashboard_auth.audit import audit_log, AuditEvent
     from hermes_cli.dashboard_auth.mobile_devices import (
         DeviceStoreError,
         PairingCodeInvalid,
@@ -2995,6 +3002,12 @@ async def complete_mobile_pairing(request: Request, body: MobilePairRequest):
     client_host = request.client.host if request.client else ""
     allowed, retry_after = check_pair_redemption(client_host)
     if not allowed:
+        audit_log(
+            AuditEvent.MOBILE_RATE_LIMIT_REJECTED,
+            operation="pair_redemption",
+            reason="rate_limit",
+            ip=client_host,
+        )
         resp = JSONResponse(
             content={"detail": "Too many pairing attempts. Try again later."},
             status_code=429,
@@ -3005,9 +3018,21 @@ async def complete_mobile_pairing(request: Request, body: MobilePairRequest):
     try:
         credential = complete_pairing(code=body.code, device_name=body.device_name)
     except PairingCodeInvalid:
+        audit_log(
+            AuditEvent.MOBILE_PAIRING_REJECTED,
+            reason="invalid_or_expired_code",
+            ip=client_host,
+        )
         raise HTTPException(status_code=401, detail="Invalid or expired pairing code")
     except DeviceStoreError:
         raise HTTPException(status_code=503, detail="Device store unavailable")
+
+    audit_log(
+        AuditEvent.MOBILE_PAIRING_REDEEMED,
+        device_id=credential.device_id,
+        device_name=credential.device_name,
+        ip=client_host,
+    )
     response = JSONResponse(content={
         "device_id": credential.device_id,
         "device_secret": credential.device_secret,
@@ -3022,6 +3047,7 @@ async def complete_mobile_pairing(request: Request, body: MobilePairRequest):
 @app.post("/api/mobile/ws-ticket")
 async def mobile_ws_ticket(request: Request, body: MobileWsTicketRequest):
     """Mint a short-lived `/api/ws` ticket from a paired mobile device secret."""
+    from hermes_cli.dashboard_auth.audit import audit_log, AuditEvent, ticket_fingerprint
     from hermes_cli.dashboard_auth.mobile_devices import (
         DeviceAuthInvalid,
         DeviceStoreError,
@@ -3033,6 +3059,13 @@ async def mobile_ws_ticket(request: Request, body: MobileWsTicketRequest):
     client_host = request.client.host if request.client else ""
     allowed, retry_after = check_ticket_mint(client_host, body.device_id)
     if not allowed:
+        audit_log(
+            AuditEvent.MOBILE_RATE_LIMIT_REJECTED,
+            operation="ticket_mint",
+            reason="rate_limit",
+            device_id=body.device_id,
+            ip=client_host,
+        )
         resp = JSONResponse(
             content={"detail": "Too many ticket requests. Try again later."},
             status_code=429,
@@ -3046,6 +3079,12 @@ async def mobile_ws_ticket(request: Request, body: MobileWsTicketRequest):
             device_secret=body.device_secret,
         )
     except DeviceAuthInvalid:
+        audit_log(
+            AuditEvent.MOBILE_TICKET_MINT_REJECTED,
+            reason="invalid_device_credential",
+            device_id=body.device_id,
+            ip=client_host,
+        )
         raise HTTPException(status_code=401, detail="Invalid device credential")
     except DeviceStoreError:
         raise HTTPException(status_code=503, detail="Device store unavailable")
@@ -3054,6 +3093,12 @@ async def mobile_ws_ticket(request: Request, body: MobileWsTicketRequest):
         user_id=principal.user_id,
         provider=principal.provider,
         audience="/api/ws",
+    )
+    audit_log(
+        AuditEvent.MOBILE_TICKET_MINTED,
+        device_id=body.device_id,
+        ticket_fp=ticket_fingerprint(ticket),
+        ip=client_host,
     )
     return {"ticket": ticket, "ttl_seconds": TTL_SECONDS}
 
@@ -3092,6 +3137,7 @@ async def list_mobile_devices(request: Request):
 async def revoke_mobile_device(request: Request, device_id: str):
     """Revoke a device credential immediately. Idempotent."""
     _require_token(request)
+    from hermes_cli.dashboard_auth.audit import audit_log, AuditEvent
     from hermes_cli.dashboard_auth.mobile_devices import (
         DeviceAuthInvalid,
         DeviceStoreError,
@@ -3108,6 +3154,12 @@ async def revoke_mobile_device(request: Request, device_id: str):
 
     # Purge outstanding mobile tickets for this device user.
     purge_mobile_tickets(user_id=f"mobile:{device_id}")
+
+    audit_log(
+        AuditEvent.MOBILE_DEVICE_REVOKED,
+        device_id=device_id,
+        ip=request.client.host if request.client else "",
+    )
     return {"revoked": True}
 
 
@@ -3137,6 +3189,7 @@ class MobileCredentialRotateRequest(BaseModel):
 @app.post("/api/mobile/credential/rotate")
 async def rotate_mobile_credential(request: Request, body: MobileCredentialRotateRequest):
     """Rotate a device credential. Requires the current valid secret."""
+    from hermes_cli.dashboard_auth.audit import audit_log, AuditEvent
     from hermes_cli.dashboard_auth.mobile_devices import (
         DeviceAuthInvalid,
         DeviceStoreError,
@@ -3148,6 +3201,13 @@ async def rotate_mobile_credential(request: Request, body: MobileCredentialRotat
     client_host = request.client.host if request.client else ""
     allowed, retry_after = check_credential_rotation(client_host, body.device_id)
     if not allowed:
+        audit_log(
+            AuditEvent.MOBILE_RATE_LIMIT_REJECTED,
+            operation="credential_rotation",
+            reason="rate_limit",
+            device_id=body.device_id,
+            ip=client_host,
+        )
         resp = JSONResponse(
             content={"detail": "Too many rotation requests. Try again later."},
             status_code=429,
@@ -3161,12 +3221,24 @@ async def rotate_mobile_credential(request: Request, body: MobileCredentialRotat
             device_secret=body.device_secret,
         )
     except DeviceAuthInvalid:
+        audit_log(
+            AuditEvent.MOBILE_CREDENTIAL_ROTATION_REJECTED,
+            reason="invalid_current_credential",
+            device_id=body.device_id,
+            ip=client_host,
+        )
         raise HTTPException(status_code=401, detail="Invalid device credential")
     except DeviceStoreError:
         raise HTTPException(status_code=503, detail="Device store unavailable")
 
     # Purge outstanding mobile tickets for this device user.
     purge_mobile_tickets(user_id=f"mobile:{body.device_id}")
+
+    audit_log(
+        AuditEvent.MOBILE_CREDENTIAL_ROTATED,
+        device_id=body.device_id,
+        ip=client_host,
+    )
 
     response = JSONResponse(content={
         "device_id": body.device_id,
@@ -17547,8 +17619,8 @@ def _ws_auth_mode() -> str:
     return "loopback"
 
 
-def _ws_auth_reason(ws: "WebSocket") -> tuple[Optional[str], str]:
-    """Validate WS-upgrade auth; return ``(reason, credential)``.
+def _ws_auth_reason(ws: "WebSocket") -> tuple[Optional[str], str, Optional[Dict[str, Any]]]:
+    """Validate WS-upgrade auth; return ``(reason, credential, info)``.
 
     ``reason`` is None when the credential is accepted, else a short
     machine-parseable token explaining the rejection (``no_credential``,
@@ -17556,6 +17628,9 @@ def _ws_auth_reason(ws: "WebSocket") -> tuple[Optional[str], str]:
     ``credential`` names which credential type was presented (``ticket``,
     ``internal``, ``token``, or ``none``) so the accepted path can log *how*
     a peer authed, not just that it did.
+    ``info`` is the ticket/consumer info dict on success (``{user_id, provider,
+    minted_at, ...}``), else ``None``. Callers that need identity metadata
+    (e.g., audit correlation) can read ``info`` without re-consuming.
 
     Loopback / ``--insecure`` accepts the legacy session token and
     audience-bound mobile tickets. Gated mode accepts browser/mobile tickets
@@ -17586,8 +17661,8 @@ def _ws_auth_reason(ws: "WebSocket") -> tuple[Optional[str], str]:
         internal = ws.query_params.get("internal", "")
         if internal:
             try:
-                consume_internal_credential(internal)
-                return None, "internal"
+                info = consume_internal_credential(internal)
+                return None, "internal", info
             except TicketInvalid as exc:
                 audit_log(
                     AuditEvent.WS_TICKET_REJECTED,
@@ -17595,7 +17670,7 @@ def _ws_auth_reason(ws: "WebSocket") -> tuple[Optional[str], str]:
                     ip=(ws.client.host if ws.client else ""),
                     path=ws.url.path,
                 )
-                return "internal_invalid", "internal"
+                return "internal_invalid", "internal", None
     else:
         from hermes_cli.dashboard_auth.audit import AuditEvent, audit_log
         from hermes_cli.dashboard_auth.ws_tickets import TicketInvalid, consume_ticket
@@ -17603,8 +17678,8 @@ def _ws_auth_reason(ws: "WebSocket") -> tuple[Optional[str], str]:
     ticket = ws.query_params.get("ticket", "")
     if ticket:
         try:
-            consume_ticket(ticket, audience=ws.url.path)
-            return None, "ticket"
+            info = consume_ticket(ticket, audience=ws.url.path)
+            return None, "ticket", info
         except TicketInvalid as exc:
             audit_log(
                 AuditEvent.WS_TICKET_REJECTED,
@@ -17612,17 +17687,17 @@ def _ws_auth_reason(ws: "WebSocket") -> tuple[Optional[str], str]:
                 ip=(ws.client.host if ws.client else ""),
                 path=ws.url.path,
             )
-            return "ticket_invalid", "ticket"
+            return "ticket_invalid", "ticket", None
 
     if auth_required:
-        return "no_credential", "none"
+        return "no_credential", "none", None
 
     token = ws.query_params.get("token", "")
     if not token:
-        return "no_credential", "none"
+        return "no_credential", "none", None
     if hmac.compare_digest(token.encode(), _SESSION_TOKEN.encode()):
-        return None, "token"
-    return "token_mismatch", "token"
+        return None, "token", None
+    return "token_mismatch", "token", None
 
 
 def _ws_auth_ok(ws: "WebSocket") -> bool:
@@ -18175,7 +18250,7 @@ async def console_ws(ws: WebSocket) -> None:
         await ws.close(code=4404, reason="embedded chat disabled")
         return
 
-    auth_reason, cred = _ws_auth_reason(ws)
+    auth_reason, cred, _ = _ws_auth_reason(ws)
     mode = _ws_auth_mode()
     if auth_reason is not None:
         _log.warning(
@@ -18531,7 +18606,7 @@ async def pty_ws(ws: WebSocket) -> None:
     #     browser banner agree on the cause:
     #       4401 bad credential   4403 host/origin mismatch
     #       4408 peer not allowed  4404 chat disabled
-    auth_reason, cred = _ws_auth_reason(ws)
+    auth_reason, cred, _ = _ws_auth_reason(ws)
     mode = _ws_auth_mode()
     if auth_reason is not None:
         _log.warning(
@@ -18709,13 +18784,39 @@ async def gateway_ws(ws: WebSocket) -> None:
         await ws.close(code=4403)
         return
 
-    if not _ws_auth_ok(ws):
+    # Authenticate exactly once — _ws_auth_reason consumes the ticket.
+    # On success we retain the credential type and the ticket info dict
+    # so the audit branch has identity metadata without re-consumption.
+    auth_reason, cred_type, ticket_info = _ws_auth_reason(ws)
+    if auth_reason is not None:
         await ws.close(code=4401)
         return
 
     if not _ws_request_is_allowed(ws):
         await ws.close(code=4403)
         return
+
+    # Audit mobile WS acceptance — only for mobile ticket principals.
+    # Browser tickets (user_id does not start with 'mobile:') and
+    # internal credentials must not emit a mobile acceptance event.
+    if cred_type == "ticket" and ticket_info:
+        from hermes_cli.dashboard_auth.audit import (
+            AuditEvent, audit_log, ticket_fingerprint,
+        )
+        user_id = ticket_info.get("user_id", "")
+        if user_id.startswith("mobile:"):
+            raw_ticket = ws.query_params.get("ticket", "")
+            ticket_fp = ticket_fingerprint(raw_ticket) if raw_ticket else ""
+            # Normalize device_id from user_id (e.g., 'mobile:ios_abc123' -> 'ios_abc123')
+            device_id = user_id[len("mobile:"):] if user_id else ""
+            audit_log(
+                AuditEvent.MOBILE_WS_ACCEPTED,
+                ticket_fp=ticket_fp,
+                device_id=device_id,
+                user_id=user_id,
+                ip=ws.client.host if ws.client else "",
+                path=ws.url.path,
+            )
 
     from tui_gateway.ws import handle_ws
 
