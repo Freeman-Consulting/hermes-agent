@@ -40,6 +40,9 @@ from hermes_cli.dashboard_auth.ws_tickets import (
     _reset_for_tests as reset_tickets,
     mint_ticket,
 )
+from hermes_cli.dashboard_auth.mobile_rate_limit import (
+    _reset_for_tests as reset_rate_limits,
+)
 from hermes_cli.dashboard_auth import ws_tickets
 
 
@@ -48,9 +51,11 @@ def _isolated_home(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     _reset_for_tests()
     reset_tickets()
+    reset_rate_limits()
     yield tmp_path
     _reset_for_tests()
     reset_tickets()
+    reset_rate_limits()
 
 
 @pytest.fixture
