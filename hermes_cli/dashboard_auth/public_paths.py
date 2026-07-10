@@ -57,4 +57,10 @@ PUBLIC_API_PATHS: frozenset[str] = frozenset({
     # the NAS relay's bearer-only callback reaches the verifier instead of a
     # 401 no_cookie. The JWT — not this allowlist — is the security boundary.
     "/api/cron/fire",
+    # Hermes Pocket mobile pairing endpoints are not dashboard-cookie gated
+    # because the phone has no cookie before pairing. They carry their own
+    # one-time pairing code / device-secret verifier and fail closed there.
+    # The authenticated code-creation endpoint is deliberately NOT public.
+    "/api/mobile/pair",
+    "/api/mobile/ws-ticket",
 })
