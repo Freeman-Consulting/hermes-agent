@@ -165,6 +165,22 @@ def consume_internal_credential(value: str) -> Dict[str, Any]:
     }
 
 
+def purge_mobile_tickets(*, user_id: str) -> int:
+    """Remove outstanding in-process tickets for a specific mobile user_id.
+
+    Preserves browser/internal tickets: only tickets whose info user_id
+    matches the given value are purged. Returns the count of purged tickets.
+    """
+    with _lock:
+        to_remove = [
+            ticket for ticket, (_exp, info) in _tickets.items()
+            if info.get("user_id") == user_id
+        ]
+        for ticket in to_remove:
+            _tickets.pop(ticket, None)
+        return len(to_remove)
+
+
 def _reset_for_tests() -> None:
     """Test-only: drop all tickets and the internal credential."""
     global _internal_credential

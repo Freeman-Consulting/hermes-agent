@@ -702,6 +702,129 @@ def verify_device(*, device_id: str, device_secret: str) -> MobileDevicePrincipa
             conn.close()
 
 
+@dataclass(frozen=True)
+class MobileDeviceInfo:
+    """Safe device metadata — never carries secret/hash material."""
+    device_id: str
+    device_name: str
+    created_at: str
+    last_used_at: Optional[str]
+    revoked_at: Optional[str]
+    credential_version: int
+
+    @property
+    def is_revoked(self) -> bool:
+        return self.revoked_at is not None
+
+
+def list_devices() -> list[MobileDeviceInfo]:
+    """Return safe metadata for all registered devices, deterministic order."""
+    with _lock:
+        conn = _open_store_unlocked()
+        try:
+            rows = conn.execute(
+                """
+                SELECT device_id, device_name, created_at, last_used_at,
+                       revoked_at, credential_version
+                FROM devices
+                ORDER BY device_id
+                """
+            ).fetchall()
+            return [
+                MobileDeviceInfo(
+                    device_id=str(row["device_id"]),
+                    device_name=str(row["device_name"]),
+                    created_at=str(row["created_at"]),
+                    last_used_at=str(row["last_used_at"]) if row["last_used_at"] else None,
+                    revoked_at=str(row["revoked_at"]) if row["revoked_at"] else None,
+                    credential_version=int(row["credential_version"]),
+                )
+                for row in rows
+            ]
+        finally:
+            conn.close()
+
+
+def revoke_device(*, device_id: str) -> None:
+    """Revoke a device credential immediately.
+
+    Persists ``revoked_at`` transactionally. Idempotent: calling on an
+    already-revoked device is a no-op that succeeds.
+    Raises ``DeviceAuthInvalid`` for unknown device IDs.
+    """
+    cleaned_id = (device_id or "").strip()
+    with _lock:
+        conn = _open_store_unlocked()
+        try:
+            with write_txn(conn):
+                row = conn.execute(
+                    "SELECT device_id, revoked_at FROM devices WHERE device_id = ?",
+                    (cleaned_id,),
+                ).fetchone()
+                if row is None:
+                    raise DeviceAuthInvalid("unknown device")
+                revoked_at = _utc_now_iso()
+                conn.execute(
+                    "UPDATE devices SET revoked_at = ? WHERE device_id = ?",
+                    (revoked_at, cleaned_id),
+                )
+            _restrict_live_store_files(_db_path())
+        finally:
+            conn.close()
+
+
+def rotate_credential(*, device_id: str, device_secret: str) -> str:
+    """Rotate a device credential: atomically replace the secret and increment version.
+
+    The caller must present the *current* valid credential. On success:
+    - The old secret fails immediately.
+    - The ``credential_version`` is incremented.
+    - A new raw secret is returned once and never persisted or logged.
+
+    Raises ``DeviceAuthInvalid`` if the current credential is wrong,
+    the device is unknown, or the device is revoked.
+    """
+    cleaned_id = (device_id or "").strip()
+    cleaned_secret = (device_secret or "").strip()
+    if not cleaned_id or not cleaned_secret:
+        raise DeviceAuthInvalid("missing device credential")
+    provided_hash = _hash_secret(cleaned_secret)
+    new_secret = secrets.token_urlsafe(32)
+    new_hash = _hash_secret(new_secret)
+    with _lock:
+        conn = _open_store_unlocked()
+        try:
+            with write_txn(conn):
+                row = conn.execute(
+                    """
+                    SELECT device_id, secret_sha256, revoked_at, credential_version
+                    FROM devices WHERE device_id = ?
+                    """,
+                    (cleaned_id,),
+                ).fetchone()
+                if row is None:
+                    raise DeviceAuthInvalid("unknown device")
+                if row["revoked_at"] is not None:
+                    raise DeviceAuthInvalid("device credential disabled")
+                expected_hash = str(row["secret_sha256"] or "")
+                if not expected_hash or not hmac.compare_digest(
+                    provided_hash, expected_hash
+                ):
+                    raise DeviceAuthInvalid("invalid device credential")
+                new_version = int(row["credential_version"]) + 1
+                conn.execute(
+                    """
+                    UPDATE devices SET secret_sha256 = ?, credential_version = ?
+                    WHERE device_id = ?
+                    """,
+                    (new_hash, new_version, cleaned_id),
+                )
+            _restrict_live_store_files(_db_path())
+            return new_secret
+        finally:
+            conn.close()
+
+
 def _reset_for_tests() -> None:
     """Test-only: clear process-local pairing codes and persisted devices."""
     with _lock:

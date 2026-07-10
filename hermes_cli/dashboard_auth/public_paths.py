@@ -61,6 +61,8 @@ PUBLIC_API_PATHS: frozenset[str] = frozenset({
     # because the phone has no cookie before pairing. They carry their own
     # one-time pairing code / device-secret verifier and fail closed there.
     # The authenticated code-creation endpoint is deliberately NOT public.
+    # Device list and revoke are sensitive admin routes gated by dashboard auth.
     "/api/mobile/pair",
     "/api/mobile/ws-ticket",
+    "/api/mobile/credential/rotate",
 })

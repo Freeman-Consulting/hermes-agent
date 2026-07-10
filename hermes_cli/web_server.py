@@ -2938,6 +2938,7 @@ async def create_mobile_pairing_code(request: Request, body: MobilePairingCodeRe
 async def complete_mobile_pairing(body: MobilePairRequest):
     """Redeem a one-time pairing code and return the device secret once."""
     from hermes_cli.dashboard_auth.mobile_devices import (
+        DeviceStoreError,
         PairingCodeInvalid,
         complete_pairing,
     )
@@ -2946,12 +2947,17 @@ async def complete_mobile_pairing(body: MobilePairRequest):
         credential = complete_pairing(code=body.code, device_name=body.device_name)
     except PairingCodeInvalid:
         raise HTTPException(status_code=401, detail="Invalid or expired pairing code")
-    return {
+    except DeviceStoreError:
+        raise HTTPException(status_code=503, detail="Device store unavailable")
+    response = JSONResponse(content={
         "device_id": credential.device_id,
         "device_secret": credential.device_secret,
         "device_name": credential.device_name,
         "created_at": credential.created_at,
-    }
+    })
+    response.headers["Cache-Control"] = "no-store"
+    response.headers["Pragma"] = "no-cache"
+    return response
 
 
 @app.post("/api/mobile/ws-ticket")
@@ -2959,6 +2965,7 @@ async def mobile_ws_ticket(body: MobileWsTicketRequest):
     """Mint a short-lived `/api/ws` ticket from a paired mobile device secret."""
     from hermes_cli.dashboard_auth.mobile_devices import (
         DeviceAuthInvalid,
+        DeviceStoreError,
         verify_device,
     )
     from hermes_cli.dashboard_auth.ws_tickets import TTL_SECONDS, mint_ticket
@@ -2970,6 +2977,8 @@ async def mobile_ws_ticket(body: MobileWsTicketRequest):
         )
     except DeviceAuthInvalid:
         raise HTTPException(status_code=401, detail="Invalid device credential")
+    except DeviceStoreError:
+        raise HTTPException(status_code=503, detail="Device store unavailable")
 
     ticket = mint_ticket(
         user_id=principal.user_id,
@@ -2977,6 +2986,96 @@ async def mobile_ws_ticket(body: MobileWsTicketRequest):
         audience="/api/ws",
     )
     return {"ticket": ticket, "ttl_seconds": TTL_SECONDS}
+
+
+# ---------------------------------------------------------------------------
+# Mobile device lifecycle controls (Phase 2)
+# ---------------------------------------------------------------------------
+
+@app.get("/api/mobile/devices")
+async def list_mobile_devices(request: Request):
+    """List all registered mobile devices (safe metadata only)."""
+    _require_token(request)
+    from hermes_cli.dashboard_auth.mobile_devices import (
+        DeviceStoreError,
+        list_devices,
+    )
+
+    try:
+        devices = list_devices()
+    except DeviceStoreError:
+        raise HTTPException(status_code=503, detail="Device store unavailable")
+    return [
+        {
+            "device_id": d.device_id,
+            "device_name": d.device_name,
+            "created_at": d.created_at,
+            "last_used_at": d.last_used_at,
+            "revoked_at": d.revoked_at,
+            "credential_version": d.credential_version,
+        }
+        for d in devices
+    ]
+
+
+@app.post("/api/mobile/devices/{device_id}/revoke")
+async def revoke_mobile_device(request: Request, device_id: str):
+    """Revoke a device credential immediately. Idempotent."""
+    _require_token(request)
+    from hermes_cli.dashboard_auth.mobile_devices import (
+        DeviceAuthInvalid,
+        DeviceStoreError,
+        revoke_device,
+    )
+    from hermes_cli.dashboard_auth.ws_tickets import purge_mobile_tickets
+
+    try:
+        revoke_device(device_id=device_id)
+    except DeviceAuthInvalid:
+        raise HTTPException(status_code=404, detail="Device not found")
+    except DeviceStoreError:
+        raise HTTPException(status_code=503, detail="Device store unavailable")
+
+    # Purge outstanding mobile tickets for this device user.
+    purge_mobile_tickets(user_id=f"mobile:{device_id}")
+    return {"revoked": True}
+
+
+class MobileCredentialRotateRequest(BaseModel):
+    device_id: str
+    device_secret: str
+
+
+@app.post("/api/mobile/credential/rotate")
+async def rotate_mobile_credential(body: MobileCredentialRotateRequest):
+    """Rotate a device credential. Requires the current valid secret."""
+    from hermes_cli.dashboard_auth.mobile_devices import (
+        DeviceAuthInvalid,
+        DeviceStoreError,
+        rotate_credential,
+    )
+    from hermes_cli.dashboard_auth.ws_tickets import purge_mobile_tickets
+
+    try:
+        new_secret = rotate_credential(
+            device_id=body.device_id,
+            device_secret=body.device_secret,
+        )
+    except DeviceAuthInvalid:
+        raise HTTPException(status_code=401, detail="Invalid device credential")
+    except DeviceStoreError:
+        raise HTTPException(status_code=503, detail="Device store unavailable")
+
+    # Purge outstanding mobile tickets for this device user.
+    purge_mobile_tickets(user_id=f"mobile:{body.device_id}")
+
+    response = JSONResponse(content={
+        "device_id": body.device_id,
+        "device_secret": new_secret,
+    })
+    response.headers["Cache-Control"] = "no-store"
+    response.headers["Pragma"] = "no-cache"
+    return response
 
 
 # Host TCP ports each port-binding gateway platform listens on, as
