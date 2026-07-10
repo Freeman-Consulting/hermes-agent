@@ -1308,15 +1308,63 @@ class WhatsAppOnboardingApply(BaseModel):
 class MobilePairingCodeRequest(BaseModel):
     device_name: Optional[str] = None
 
+    @field_validator("device_name")
+    @classmethod
+    def _device_name_bound(cls, v: Optional[str]) -> Optional[str]:
+        if v is not None and len(v) > 80:
+            raise ValueError("device_name exceeds 80 characters")
+        return v
+
 
 class MobilePairRequest(BaseModel):
     code: str
     device_name: Optional[str] = None
 
+    @field_validator("code")
+    @classmethod
+    def _code_bound(cls, v: str) -> str:
+        from hermes_cli.dashboard_auth.mobile_devices import (
+            PAIRING_CODE_ALPHABET,
+            _normalize_code,
+        )
+        if len(v) > 32:
+            raise ValueError("pairing code raw input exceeds 32 characters")
+        normalized = _normalize_code(v)
+        if len(normalized) != 8:
+            raise ValueError("pairing code must normalize to exactly 8 characters")
+        if not all(ch in PAIRING_CODE_ALPHABET for ch in normalized):
+            raise ValueError("pairing code contains invalid characters")
+        return v
+
+    @field_validator("device_name")
+    @classmethod
+    def _device_name_bound(cls, v: Optional[str]) -> Optional[str]:
+        if v is not None and len(v) > 80:
+            raise ValueError("device_name exceeds 80 characters")
+        return v
+
 
 class MobileWsTicketRequest(BaseModel):
     device_id: str
     device_secret: str
+
+    @field_validator("device_id")
+    @classmethod
+    def _device_id_bound(cls, v: str) -> str:
+        if not v:
+            raise ValueError("device_id is required")
+        if len(v) > 64:
+            raise ValueError("device_id exceeds 64 characters")
+        return v
+
+    @field_validator("device_secret")
+    @classmethod
+    def _device_secret_bound(cls, v: str) -> str:
+        if not v:
+            raise ValueError("device_secret is required")
+        if len(v) > 256:
+            raise ValueError("device_secret exceeds 256 characters")
+        return v
 
 
 class AudioTranscriptionRequest(BaseModel):
@@ -2935,13 +2983,24 @@ async def create_mobile_pairing_code(request: Request, body: MobilePairingCodeRe
 
 
 @app.post("/api/mobile/pair")
-async def complete_mobile_pairing(body: MobilePairRequest):
+async def complete_mobile_pairing(request: Request, body: MobilePairRequest):
     """Redeem a one-time pairing code and return the device secret once."""
     from hermes_cli.dashboard_auth.mobile_devices import (
         DeviceStoreError,
         PairingCodeInvalid,
         complete_pairing,
     )
+    from hermes_cli.dashboard_auth.mobile_rate_limit import check_pair_redemption
+
+    client_host = request.client.host if request.client else ""
+    allowed, retry_after = check_pair_redemption(client_host)
+    if not allowed:
+        resp = JSONResponse(
+            content={"detail": "Too many pairing attempts. Try again later."},
+            status_code=429,
+        )
+        resp.headers["Retry-After"] = str(retry_after)
+        return resp
 
     try:
         credential = complete_pairing(code=body.code, device_name=body.device_name)
@@ -2961,14 +3020,25 @@ async def complete_mobile_pairing(body: MobilePairRequest):
 
 
 @app.post("/api/mobile/ws-ticket")
-async def mobile_ws_ticket(body: MobileWsTicketRequest):
+async def mobile_ws_ticket(request: Request, body: MobileWsTicketRequest):
     """Mint a short-lived `/api/ws` ticket from a paired mobile device secret."""
     from hermes_cli.dashboard_auth.mobile_devices import (
         DeviceAuthInvalid,
         DeviceStoreError,
         verify_device,
     )
+    from hermes_cli.dashboard_auth.mobile_rate_limit import check_ticket_mint
     from hermes_cli.dashboard_auth.ws_tickets import TTL_SECONDS, mint_ticket
+
+    client_host = request.client.host if request.client else ""
+    allowed, retry_after = check_ticket_mint(client_host, body.device_id)
+    if not allowed:
+        resp = JSONResponse(
+            content={"detail": "Too many ticket requests. Try again later."},
+            status_code=429,
+        )
+        resp.headers["Retry-After"] = str(retry_after)
+        return resp
 
     try:
         principal = verify_device(
@@ -3045,16 +3115,45 @@ class MobileCredentialRotateRequest(BaseModel):
     device_id: str
     device_secret: str
 
+    @field_validator("device_id")
+    @classmethod
+    def _device_id_bound(cls, v: str) -> str:
+        if not v:
+            raise ValueError("device_id is required")
+        if len(v) > 64:
+            raise ValueError("device_id exceeds 64 characters")
+        return v
+
+    @field_validator("device_secret")
+    @classmethod
+    def _device_secret_bound(cls, v: str) -> str:
+        if not v:
+            raise ValueError("device_secret is required")
+        if len(v) > 256:
+            raise ValueError("device_secret exceeds 256 characters")
+        return v
+
 
 @app.post("/api/mobile/credential/rotate")
-async def rotate_mobile_credential(body: MobileCredentialRotateRequest):
+async def rotate_mobile_credential(request: Request, body: MobileCredentialRotateRequest):
     """Rotate a device credential. Requires the current valid secret."""
     from hermes_cli.dashboard_auth.mobile_devices import (
         DeviceAuthInvalid,
         DeviceStoreError,
         rotate_credential,
     )
+    from hermes_cli.dashboard_auth.mobile_rate_limit import check_credential_rotation
     from hermes_cli.dashboard_auth.ws_tickets import purge_mobile_tickets
+
+    client_host = request.client.host if request.client else ""
+    allowed, retry_after = check_credential_rotation(client_host, body.device_id)
+    if not allowed:
+        resp = JSONResponse(
+            content={"detail": "Too many rotation requests. Try again later."},
+            status_code=429,
+        )
+        resp.headers["Retry-After"] = str(retry_after)
+        return resp
 
     try:
         new_secret = rotate_credential(
