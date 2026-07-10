@@ -74,6 +74,13 @@ class AuditEvent(enum.Enum):
     MOBILE_CREDENTIAL_ROTATED = "mobile_credential_rotated"
     MOBILE_CREDENTIAL_ROTATION_REJECTED = "mobile_credential_rotation_rejected"
     MOBILE_RATE_LIMIT_REJECTED = "mobile_rate_limit_rejected"
+    # Structured mobile ticket rejection reasons (Phase 2 correction)
+    MOBILE_TICKET_EXPIRED = "mobile_ticket_expired"
+    MOBILE_TICKET_REPLAYED = "mobile_ticket_replayed"
+    MOBILE_TICKET_WRONG_AUDIENCE = "mobile_ticket_wrong_audience"
+    MOBILE_REVOKED_DEVICE_REJECTED = "mobile_revoked_device_rejected"
+    MOBILE_REQUEST_MALFORMED = "mobile_request_malformed"
+    MOBILE_REQUEST_OVERSIZED = "mobile_request_oversized"
 
 
 def _resolve_log_path() -> Path:

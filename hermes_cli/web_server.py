@@ -107,7 +107,7 @@ try:
     from fastapi.middleware.cors import CORSMiddleware
     from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
     from fastapi.staticfiles import StaticFiles
-    from pydantic import BaseModel, SecretStr, field_validator
+    from pydantic import BaseModel, Field, SecretStr, field_validator
     from starlette.concurrency import run_in_threadpool
 except ImportError:
     # First try lazy-installing the dashboard extras. Only the user actually
@@ -123,7 +123,7 @@ except ImportError:
         from fastapi.middleware.cors import CORSMiddleware
         from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
         from fastapi.staticfiles import StaticFiles
-        from pydantic import BaseModel, SecretStr, field_validator
+        from pydantic import BaseModel, Field, SecretStr, field_validator
         from starlette.concurrency import run_in_threadpool
     except Exception:
         raise SystemExit(
@@ -280,6 +280,57 @@ def _get_pty_active_session_files(app: "FastAPI") -> dict[str, Path]:
 
 
 app = FastAPI(title="Hermes Agent", version=__version__, lifespan=_lifespan)
+
+# Mobile route validation error handler: emit structured audit events
+# for malformed/oversized requests to mobile endpoints.
+try:
+    from fastapi.exceptions import RequestValidationError
+except ImportError:
+    RequestValidationError = None  # type: ignore[misc,assignment]
+
+
+def _is_mobile_route(path: str) -> bool:
+    return path.startswith("/api/mobile/")
+
+
+if RequestValidationError is not None:
+
+    @app.exception_handler(RequestValidationError)
+    async def _mobile_validation_error_handler(
+        request: Request, exc: RequestValidationError
+    ):
+        from hermes_cli.dashboard_auth.audit import AuditEvent, audit_log
+
+        path = request.url.path
+        client_host = request.client.host if request.client else ""
+        if _is_mobile_route(path):
+            # Classify size violations from stable Pydantic error types,
+            # never from localized/human-readable message text.
+            errors = exc.errors()
+            is_oversized = any(
+                err.get("type") in {"string_too_long", "bytes_too_long"}
+                for err in errors
+            )
+            if is_oversized:
+                audit_log(
+                    AuditEvent.MOBILE_REQUEST_OVERSIZED,
+                    reason="request_oversized",
+                    ip=client_host,
+                    path=path,
+                )
+            else:
+                audit_log(
+                    AuditEvent.MOBILE_REQUEST_MALFORMED,
+                    reason="request_malformed",
+                    ip=client_host,
+                    path=path,
+                )
+        # Return standard 422 response (FastAPI default behavior).
+        from fastapi.responses import JSONResponse
+        return JSONResponse(
+            status_code=422,
+            content={"detail": "Validation error"},
+        )
 
 # Memory-provider OAuth connect routes live in the memory layer, not here.
 from hermes_cli.memory_oauth import router as _memory_oauth_router  # noqa: E402
@@ -1345,26 +1396,8 @@ class MobilePairRequest(BaseModel):
 
 
 class MobileWsTicketRequest(BaseModel):
-    device_id: str
-    device_secret: str
-
-    @field_validator("device_id")
-    @classmethod
-    def _device_id_bound(cls, v: str) -> str:
-        if not v:
-            raise ValueError("device_id is required")
-        if len(v) > 64:
-            raise ValueError("device_id exceeds 64 characters")
-        return v
-
-    @field_validator("device_secret")
-    @classmethod
-    def _device_secret_bound(cls, v: str) -> str:
-        if not v:
-            raise ValueError("device_secret is required")
-        if len(v) > 256:
-            raise ValueError("device_secret exceeds 256 characters")
-        return v
+    device_id: str = Field(min_length=1, max_length=64)
+    device_secret: str = Field(min_length=1, max_length=256)
 
 
 class AudioTranscriptionRequest(BaseModel):
@@ -3078,13 +3111,22 @@ async def mobile_ws_ticket(request: Request, body: MobileWsTicketRequest):
             device_id=body.device_id,
             device_secret=body.device_secret,
         )
-    except DeviceAuthInvalid:
-        audit_log(
-            AuditEvent.MOBILE_TICKET_MINT_REJECTED,
-            reason="invalid_device_credential",
-            device_id=body.device_id,
-            ip=client_host,
-        )
+    except DeviceAuthInvalid as exc:
+        # Distinguish revoked-device rejections from generic auth failures.
+        if "disabled" in str(exc):
+            audit_log(
+                AuditEvent.MOBILE_REVOKED_DEVICE_REJECTED,
+                reason="revoked_device",
+                device_id=body.device_id,
+                ip=client_host,
+            )
+        else:
+            audit_log(
+                AuditEvent.MOBILE_TICKET_MINT_REJECTED,
+                reason="invalid_device_credential",
+                device_id=body.device_id,
+                ip=client_host,
+            )
         raise HTTPException(status_code=401, detail="Invalid device credential")
     except DeviceStoreError:
         raise HTTPException(status_code=503, detail="Device store unavailable")
@@ -17709,12 +17751,39 @@ def _ws_auth_reason(ws: "WebSocket") -> tuple[Optional[str], str, Optional[Dict[
             info = consume_ticket(ticket, audience=ws.url.path)
             return None, "ticket", info
         except TicketInvalid as exc:
-            audit_log(
-                AuditEvent.WS_TICKET_REJECTED,
-                reason=str(exc),
-                ip=(ws.client.host if ws.client else ""),
-                path=ws.url.path,
-            )
+            # Emit structured mobile rejection events for mobile tickets.
+            # Mobile tickets have audience="/api/ws", so rejections on
+            # /api/ws with a reason_code are mobile-specific.
+            reason_code = getattr(exc, "reason_code", "")
+            client_ip = ws.client.host if ws.client else ""
+            if ws.url.path == "/api/ws" and reason_code:
+                reason_map = {
+                    "expired": AuditEvent.MOBILE_TICKET_EXPIRED,
+                    "replayed": AuditEvent.MOBILE_TICKET_REPLAYED,
+                    "wrong_audience": AuditEvent.MOBILE_TICKET_WRONG_AUDIENCE,
+                }
+                structured_event = reason_map.get(reason_code)
+                if structured_event:
+                    audit_log(
+                        structured_event,
+                        reason=reason_code,
+                        ip=client_ip,
+                        path=ws.url.path,
+                    )
+                else:
+                    audit_log(
+                        AuditEvent.WS_TICKET_REJECTED,
+                        reason=str(exc),
+                        ip=client_ip,
+                        path=ws.url.path,
+                    )
+            else:
+                audit_log(
+                    AuditEvent.WS_TICKET_REJECTED,
+                    reason=str(exc),
+                    ip=client_ip,
+                    path=ws.url.path,
+                )
             return "ticket_invalid", "ticket", None
 
     if auth_required:

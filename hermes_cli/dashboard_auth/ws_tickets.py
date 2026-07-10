@@ -43,6 +43,9 @@ TTL_SECONDS = 30
 
 _lock = threading.Lock()
 _tickets: Dict[str, Tuple[int, Dict[str, Any]]] = {}  # ticket -> (expires_at, info)
+# Short-lived tombstones distinguish a genuine replay from an arbitrary
+# unknown ticket without retaining the ticket indefinitely.
+_consumed_tickets: Dict[str, int] = {}  # ticket -> tombstone expiry
 
 #: The process-lifetime internal credential (see module docstring). Lazily
 #: minted on first ``internal_ws_credential()`` call and stable for the life
@@ -57,6 +60,10 @@ INTERNAL_PROVIDER = "server-internal"
 
 class TicketInvalid(Exception):
     """Ticket missing, expired, or already consumed."""
+
+    def __init__(self, message: str, *, reason_code: str = "") -> None:
+        super().__init__(message)
+        self.reason_code = reason_code
 
 
 def mint_ticket(*, user_id: str, provider: str, audience: Optional[str] = None) -> str:
@@ -101,13 +108,18 @@ def consume_ticket(ticket: str, *, audience: Optional[str] = None) -> Dict[str, 
             # Truncate ticket value in the error so misuse never logs the
             # secret in full.
             truncated = (ticket[:8] + "…") if ticket else "<empty>"
-            raise TicketInvalid(f"unknown ticket: {truncated}")
+            reason_code = "replayed" if ticket in _consumed_tickets else "unknown"
+            raise TicketInvalid(
+                f"unknown ticket: {truncated}",
+                reason_code=reason_code,
+            )
         expires_at, info = entry
         if expires_at < now:
-            raise TicketInvalid("expired")
+            raise TicketInvalid("expired", reason_code="expired")
         expected_audience = info.get("audience")
         if audience and expected_audience and expected_audience != audience:
-            raise TicketInvalid("audience mismatch")
+            raise TicketInvalid("audience mismatch", reason_code="wrong_audience")
+        _consumed_tickets[ticket] = now + TTL_SECONDS
         return info
 
 
@@ -117,6 +129,9 @@ def _gc_expired_locked() -> None:
     expired = [t for t, (exp, _) in _tickets.items() if exp < now]
     for t in expired:
         _tickets.pop(t, None)
+    expired_tombstones = [t for t, exp in _consumed_tickets.items() if exp < now]
+    for t in expired_tombstones:
+        _consumed_tickets.pop(t, None)
 
 
 def internal_ws_credential() -> str:
@@ -186,4 +201,5 @@ def _reset_for_tests() -> None:
     global _internal_credential
     with _lock:
         _tickets.clear()
+        _consumed_tickets.clear()
         _internal_credential = None
