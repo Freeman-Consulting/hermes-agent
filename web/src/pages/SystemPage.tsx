@@ -57,6 +57,7 @@ import type {
   UpdateCheckResponse,
   CuratorStatus,
   PortalStatus,
+  MobileOpsStatus,
   DebugShareResponse,
 } from "@/lib/api";
 
@@ -202,6 +203,7 @@ export default function SystemPage() {
   const [hooks, setHooks] = useState<HooksResponse | null>(null);
   const [curator, setCurator] = useState<CuratorStatus | null>(null);
   const [portal, setPortal] = useState<PortalStatus | null>(null);
+  const [mobileOps, setMobileOps] = useState<MobileOpsStatus | null>(null);
   const [loading, setLoading] = useState(true);
 
   const [activeAction, setActiveAction] = useState<string | null>(null);
@@ -262,11 +264,12 @@ export default function SystemPage() {
       api.getHooks(),
       api.getCurator(),
       api.getPortal(),
+      api.getMobileOpsStatus(),
       // Cached (non-forced) check so the version row shows update status on
       // load without a separate effect / a forced network round-trip.
       api.checkHermesUpdate(false),
     ])
-      .then(([s, st, m, p, c, h, cur, prt, upd]) => {
+      .then(([s, st, m, p, c, h, cur, prt, mo, upd]) => {
         if (s.status === "fulfilled") setStatus(s.value);
         if (st.status === "fulfilled") setStats(st.value);
         if (m.status === "fulfilled") setMemory(m.value);
@@ -275,6 +278,7 @@ export default function SystemPage() {
         if (h.status === "fulfilled") setHooks(h.value);
         if (cur.status === "fulfilled") setCurator(cur.value);
         if (prt.status === "fulfilled") setPortal(prt.value);
+        if (mo.status === "fulfilled") setMobileOps(mo.value);
         if (upd.status === "fulfilled") setUpdateInfo(upd.value);
       })
       .finally(() => setLoading(false));
@@ -998,6 +1002,154 @@ export default function SystemPage() {
                 Log in with <span className="font-mono">hermes portal</span>.
               </p>
             )}
+          </CardContent>
+        </Card>
+      </section>
+
+      {/* ── Mobile health ─────────────────────────────────────────── */}
+      <section className="flex flex-col gap-3">
+        <H2 variant="sm" className="flex items-center gap-2 text-muted-foreground">
+          <Share2 className="h-4 w-4" /> Mobile health
+        </H2>
+        <Card>
+          <CardContent className="py-4">
+            <div className="grid grid-cols-2 gap-4">
+              {/* Overall health */}
+              <div>
+                <div className="text-xs text-muted-foreground mb-1">Health</div>
+                <Badge
+                  tone={
+                    mobileOps?.overall_health === "healthy"
+                      ? "success"
+                      : mobileOps?.overall_health === "degraded"
+                      ? "warning"
+                      : "destructive"
+                  }
+                >
+                  {mobileOps?.overall_health ?? "–"}
+                </Badge>
+              </div>
+              {/* Devices */}
+              <div>
+                <div className="text-xs text-muted-foreground mb-1">Devices</div>
+                <div className="text-2xl">
+                  {mobileOps?.active_device_count ?? "–"}
+                </div>
+                <div className="text-xs text-muted-foreground">
+                  active · {mobileOps?.revoked_device_count ?? 0} revoked
+                </div>
+              </div>
+              {/* Runtime version/commit */}
+              <div>
+                <div className="text-xs text-muted-foreground mb-1">Runtime</div>
+                <div className="font-mono text-xs">
+                  v{mobileOps?.runtime_version ?? "–"}
+                  {mobileOps?.runtime_commit && (
+                    <span className="text-muted-foreground">
+                      {" "}
+                      ({mobileOps.runtime_commit})
+                    </span>
+                  )}
+                </div>
+              </div>
+              {/* DB integrity */}
+              <div>
+                <div className="text-xs text-muted-foreground mb-1">DB integrity</div>
+                <div className="flex items-center gap-2">
+                  <Badge
+                    tone={
+                      mobileOps?.integrity_ok === true
+                        ? "success"
+                        : mobileOps?.integrity_ok === false
+                        ? "destructive"
+                        : "secondary"
+                    }
+                  >
+                    {mobileOps?.integrity_ok === true
+                      ? "ok"
+                      : mobileOps?.integrity_ok === false
+                      ? "failed"
+                      : "checking"}
+                  </Badge>
+                  {mobileOps?.integrity_check_ts && (
+                    <span className="text-xs text-muted-foreground">
+                      {new Date(mobileOps.integrity_check_ts).toLocaleTimeString()}
+                    </span>
+                  )}
+                </div>
+              </div>
+              {/* Schema */}
+              <div>
+                <div className="text-xs text-muted-foreground mb-1">Schema</div>
+                <div className="font-mono text-sm">
+                  {mobileOps?.registry_backend ?? "–"} v
+                  {mobileOps?.registry_schema_version ?? "–"}
+                </div>
+              </div>
+              {/* Migration */}
+              <div>
+                <div className="text-xs text-muted-foreground mb-1">Migration</div>
+                <div className="font-mono text-sm">
+                  {mobileOps?.migration_state ?? "–"}
+                </div>
+              </div>
+              {/* Latest timestamps */}
+              <div className="col-span-2">
+                <div className="text-xs text-muted-foreground mb-1">
+                  Latest activity
+                </div>
+                <div className="flex gap-4 text-xs">
+                  <div>
+                    <span className="text-muted-foreground">last mint:</span>{" "}
+                    {mobileOps?.latest_mint_ts
+                      ? new Date(mobileOps.latest_mint_ts).toLocaleTimeString()
+                      : "–"}
+                  </div>
+                  <div>
+                    <span className="text-muted-foreground">last ws accept:</span>{" "}
+                    {mobileOps?.latest_ws_accept_ts
+                      ? new Date(mobileOps.latest_ws_accept_ts).toLocaleTimeString()
+                      : "–"}
+                  </div>
+                  <div>
+                    <span className="text-muted-foreground">direct ws:</span>{" "}
+                    {mobileOps?.direct_ws_accepted ? "yes" : "no"}
+                  </div>
+                </div>
+              </div>
+              {/* Audit events */}
+              <div className="col-span-2">
+                <div className="text-xs text-muted-foreground mb-1">
+                  Audit events (24h)
+                </div>
+                <div className="grid grid-cols-3 gap-2 text-xs">
+                  <div>
+                    <span className="text-muted-foreground">mints</span>{" "}
+                    {mobileOps?.recent_mint_count ?? 0}
+                  </div>
+                  <div>
+                    <span className="text-muted-foreground">mint rejects</span>{" "}
+                    {mobileOps?.recent_mint_reject_count ?? 0}
+                  </div>
+                  <div>
+                    <span className="text-muted-foreground">pairings</span>{" "}
+                    {mobileOps?.recent_pairing_count ?? 0}
+                  </div>
+                  <div>
+                    <span className="text-muted-foreground">revocations</span>{" "}
+                    {mobileOps?.recent_revocation_count ?? 0}
+                  </div>
+                  <div>
+                    <span className="text-muted-foreground">rotations</span>{" "}
+                    {mobileOps?.recent_rotation_count ?? 0}
+                  </div>
+                  <div>
+                    <span className="text-muted-foreground">rate limited</span>{" "}
+                    {mobileOps?.recent_rate_limit_count ?? 0}
+                  </div>
+                </div>
+              </div>
+            </div>
           </CardContent>
         </Card>
       </section>
