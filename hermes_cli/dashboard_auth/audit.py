@@ -98,6 +98,7 @@ def audit_log(event: AuditEvent, **fields: Any) -> None:
     Token-like fields are dropped. Missing log directory is created.
     Write failures are logged at WARNING but never raise — auth must not
     fail because the audit logger broke.
+    Audit log files are created with mode 0600.
     """
     safe_fields = {
         k: v for k, v in fields.items()
@@ -112,8 +113,27 @@ def audit_log(event: AuditEvent, **fields: Any) -> None:
     path = _resolve_log_path()
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
+        # Restrictive parent directory mode.
+        try:
+            path.parent.chmod(0o700)
+        except OSError:
+            pass
+        # Ensure owner-only mode on the log file itself.
+        if path.exists():
+            try:
+                path.chmod(0o600)
+            except OSError:
+                pass
         with _write_lock:
-            with open(path, "a", encoding="utf-8") as f:
+            # Use os.open with explicit mode so umask cannot leave
+            # a world-readable audit log. Single ownership: os.fdopen
+            # owns the fd and closes it on exit.
+            fd = os.open(
+                str(path),
+                os.O_CREAT | os.O_WRONLY | os.O_APPEND,
+                0o600,
+            )
+            with os.fdopen(fd, "a", encoding="utf-8") as f:
                 f.write(line)
     except Exception as e:
         _log.warning("dashboard-auth audit log write failed: %s", e)

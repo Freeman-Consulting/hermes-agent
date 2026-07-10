@@ -2748,6 +2748,34 @@ async def rotate_mobile_credential(request: Request, body: MobileCredentialRotat
     return response
 
 
+# ---------------------------------------------------------------------------
+# Mobile operations status (authenticated, versioned, secret-safe)
+# ---------------------------------------------------------------------------
+
+@app.get("/api/mobile/ops-status")
+async def mobile_ops_status(request: Request):
+    """Authenticated mobile-operations read model.
+
+    Requires the same Dashboard administrative boundary as other
+    mobile device management routes. Returns a versioned, secret-safe
+    schema summarising mobile health and audit evidence.
+    """
+    _require_token(request)
+    from hermes_cli.dashboard_auth.mobile_ops import get_mobile_ops_status
+
+    try:
+        status = get_mobile_ops_status()
+    except Exception:
+        # Return a safe degraded state rather than 500
+        from hermes_cli.dashboard_auth.mobile_ops import MobileOpsStatus
+        status = MobileOpsStatus(integrity_ok=False)
+
+    result = status.to_dict()
+    response = JSONResponse(content=result)
+    response.headers["Cache-Control"] = "no-store"
+    return response
+
+
 # Host TCP ports each port-binding gateway platform listens on, as
 # ``platform-name -> (config port key, adapter default)``.  Mirrors
 # ``_PORT_BINDING_PLATFORM_VALUES`` in gateway/run.py and each adapter's
