@@ -59,6 +59,7 @@ import type {
   PortalStatus,
   MobileOpsStatus,
   MobilePairingCodeResponse,
+  MobileDevice,
   DebugShareResponse,
 } from "@/lib/api";
 
@@ -208,6 +209,7 @@ export default function SystemPage() {
   const [mobilePairing, setMobilePairing] =
     useState<MobilePairingCodeResponse | null>(null);
   const [creatingMobilePairing, setCreatingMobilePairing] = useState(false);
+  const [mobileDevices, setMobileDevices] = useState<MobileDevice[]>([]);
   const [loading, setLoading] = useState(true);
 
   const [activeAction, setActiveAction] = useState<string | null>(null);
@@ -269,11 +271,12 @@ export default function SystemPage() {
       api.getCurator(),
       api.getPortal(),
       api.getMobileOpsStatus(),
+      api.getMobileDevices(),
       // Cached (non-forced) check so the version row shows update status on
       // load without a separate effect / a forced network round-trip.
       api.checkHermesUpdate(false),
     ])
-      .then(([s, st, m, p, c, h, cur, prt, mo, upd]) => {
+      .then(([s, st, m, p, c, h, cur, prt, mo, devices, upd]) => {
         if (s.status === "fulfilled") setStatus(s.value);
         if (st.status === "fulfilled") setStats(st.value);
         if (m.status === "fulfilled") setMemory(m.value);
@@ -283,6 +286,7 @@ export default function SystemPage() {
         if (cur.status === "fulfilled") setCurator(cur.value);
         if (prt.status === "fulfilled") setPortal(prt.value);
         if (mo.status === "fulfilled") setMobileOps(mo.value);
+        if (devices.status === "fulfilled") setMobileDevices(devices.value);
         if (upd.status === "fulfilled") setUpdateInfo(upd.value);
       })
       .finally(() => setLoading(false));
@@ -649,6 +653,22 @@ export default function SystemPage() {
     ),
   });
 
+  const mobileDeviceRevoke = useConfirmDelete({
+    onDelete: useCallback(
+      async (deviceId: string) => {
+        try {
+          await api.revokeMobileDevice(deviceId);
+          showToast("Mobile device revoked", "success");
+          loadAll();
+        } catch (e) {
+          showToast(`Failed to revoke mobile device: ${e}`, "error");
+          throw e;
+        }
+      },
+      [loadAll, showToast],
+    ),
+  });
+
   if (loading) {
     return (
       <div className="flex items-center justify-center py-24">
@@ -723,6 +743,14 @@ export default function SystemPage() {
         title="Remove shell hook"
         description="Remove this hook from config and revoke its consent? It stops firing on the next restart."
         loading={hookDelete.isDeleting}
+      />
+      <DeleteConfirmDialog
+        open={mobileDeviceRevoke.isOpen}
+        onCancel={mobileDeviceRevoke.cancel}
+        onConfirm={mobileDeviceRevoke.confirm}
+        title="Revoke mobile device"
+        description="Revoke this device credential immediately? The phone will need a new pairing code before it can connect again."
+        loading={mobileDeviceRevoke.isDeleting}
       />
       <HermesConsoleModal
         open={consoleOpen}
@@ -1207,6 +1235,47 @@ export default function SystemPage() {
                     </Button>
                   </div>
                 )}
+                <div className="mt-4 flex flex-col gap-2">
+                  <div className="text-xs uppercase tracking-wider text-muted-foreground">
+                    Registered devices
+                  </div>
+                  {mobileDevices.length === 0 ? (
+                    <div className="text-sm text-muted-foreground">No registered mobile devices.</div>
+                  ) : (
+                    mobileDevices.map((device) => {
+                      const revoked = Boolean(device.revoked_at);
+                      return (
+                        <div
+                          key={device.device_id}
+                          className="flex items-center gap-3 border border-border bg-background/40 px-3 py-2"
+                        >
+                          <div className="min-w-0 flex-1">
+                            <div className="text-sm font-medium">{device.device_name}</div>
+                            <div className="text-xs text-muted-foreground">
+                              {device.last_used_at
+                                ? `Last used ${new Date(device.last_used_at).toLocaleString()}`
+                                : `Paired ${new Date(device.created_at).toLocaleString()}`}
+                            </div>
+                          </div>
+                          <Badge tone={revoked ? "secondary" : "success"}>
+                            {revoked ? "revoked" : "active"}
+                          </Badge>
+                          {!revoked && (
+                            <Button
+                              size="sm"
+                              ghost
+                              className="text-destructive"
+                              onClick={() => mobileDeviceRevoke.requestDelete(device.device_id)}
+                              prefix={<Trash2 className="h-3.5 w-3.5" />}
+                            >
+                              Revoke
+                            </Button>
+                          )}
+                        </div>
+                      );
+                    })
+                  )}
+                </div>
               </div>
             </div>
           </CardContent>

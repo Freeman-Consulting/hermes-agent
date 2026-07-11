@@ -1218,6 +1218,12 @@ export const api = {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ device_name: deviceName }),
     }),
+  getMobileDevices: () => fetchJSON<MobileDevice[]>("/api/mobile/devices"),
+  revokeMobileDevice: (deviceId: string) =>
+    fetchJSON<{ revoked: boolean }>(
+      `/api/mobile/devices/${encodeURIComponent(deviceId)}/revoke`,
+      { method: "POST" },
+    ),
 
   // ── Admin: Diagnostics (backgrounded) ───────────────────────────────
   runPromptSize: () =>
@@ -1803,6 +1809,15 @@ export interface MobilePairingCodeResponse {
   expires_at: string;
   ttl_seconds: number;
   device_name: string;
+}
+
+export interface MobileDevice {
+  device_id: string;
+  device_name: string;
+  created_at: string;
+  last_used_at: string | null;
+  revoked_at: string | null;
+  credential_version: number;
 }
 
 export interface CheckpointSession {
