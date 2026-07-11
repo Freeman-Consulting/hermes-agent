@@ -1212,6 +1212,12 @@ export const api = {
 
   // ── Admin: Mobile ops status ────────────────────────────────────────
   getMobileOpsStatus: () => fetchJSON<MobileOpsStatus>("/api/mobile/ops-status"),
+  createMobilePairingCode: (deviceName: string) =>
+    fetchJSON<MobilePairingCodeResponse>("/api/mobile/pairing-codes", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ device_name: deviceName }),
+    }),
 
   // ── Admin: Diagnostics (backgrounded) ───────────────────────────────
   runPromptSize: () =>
@@ -1790,6 +1796,13 @@ export interface MobileOpsStatus {
   latest_mint_ts: string | null;
   latest_ws_accept_ts: string | null;
   direct_ws_accepted: boolean;
+}
+
+export interface MobilePairingCodeResponse {
+  code: string;
+  expires_at: string;
+  ttl_seconds: number;
+  device_name: string;
 }
 
 export interface CheckpointSession {

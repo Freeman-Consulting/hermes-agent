@@ -58,6 +58,7 @@ import type {
   CuratorStatus,
   PortalStatus,
   MobileOpsStatus,
+  MobilePairingCodeResponse,
   DebugShareResponse,
 } from "@/lib/api";
 
@@ -204,6 +205,9 @@ export default function SystemPage() {
   const [curator, setCurator] = useState<CuratorStatus | null>(null);
   const [portal, setPortal] = useState<PortalStatus | null>(null);
   const [mobileOps, setMobileOps] = useState<MobileOpsStatus | null>(null);
+  const [mobilePairing, setMobilePairing] =
+    useState<MobilePairingCodeResponse | null>(null);
+  const [creatingMobilePairing, setCreatingMobilePairing] = useState(false);
   const [loading, setLoading] = useState(true);
 
   const [activeAction, setActiveAction] = useState<string | null>(null);
@@ -287,6 +291,19 @@ export default function SystemPage() {
   useEffect(() => {
     loadAll();
   }, [loadAll]);
+
+  const createMobilePairingCode = async () => {
+    setCreatingMobilePairing(true);
+    try {
+      const pairing = await api.createMobilePairingCode("iPhone");
+      setMobilePairing(pairing);
+      showToast("Mobile pairing code created", "success");
+    } catch (e) {
+      showToast(`Could not create mobile pairing code: ${e}`, "error");
+    } finally {
+      setCreatingMobilePairing(false);
+    }
+  };
 
   // ── Gateway lifecycle ──────────────────────────────────────────────
   const runGateway = async (verb: "start" | "stop" | "restart") => {
@@ -1148,6 +1165,48 @@ export default function SystemPage() {
                     {mobileOps?.recent_rate_limit_count ?? 0}
                   </div>
                 </div>
+              </div>
+              <div className="col-span-2 border-t border-border pt-4">
+                <div className="flex items-center justify-between gap-3">
+                  <div>
+                    <div className="text-sm font-medium">Pair a mobile device</div>
+                    <div className="text-xs text-muted-foreground">
+                      Create a short-lived one-time code, then enter it in the iPhone app under Settings → Gateway.
+                    </div>
+                  </div>
+                  <Button
+                    size="sm"
+                    onClick={createMobilePairingCode}
+                    disabled={creatingMobilePairing}
+                    prefix={creatingMobilePairing ? <Spinner /> : <KeyRound className="h-3.5 w-3.5" />}
+                  >
+                    Generate pairing code
+                  </Button>
+                </div>
+                {mobilePairing && (
+                  <div className="mt-3 flex items-center justify-between gap-3 border border-border bg-background/50 p-3">
+                    <div>
+                      <div className="text-xs text-muted-foreground">One-time pairing code</div>
+                      <div className="font-mono text-2xl tracking-[0.25em]" aria-label="Mobile pairing code">
+                        {mobilePairing.code}
+                      </div>
+                      <div className="text-xs text-muted-foreground">
+                        Expires {new Date(mobilePairing.expires_at).toLocaleTimeString()}
+                      </div>
+                    </div>
+                    <Button
+                      size="sm"
+                      ghost
+                      prefix={<Copy className="h-3.5 w-3.5" />}
+                      onClick={async () => {
+                        await navigator.clipboard.writeText(mobilePairing.code);
+                        showToast("Pairing code copied", "success");
+                      }}
+                    >
+                      Copy
+                    </Button>
+                  </div>
+                )}
               </div>
             </div>
           </CardContent>
