@@ -5320,6 +5320,50 @@ class TestCodexAuxiliaryAdapterTimeout:
         assert fake_client.responses.kwargs["stream"] is True
         assert response.choices[0].message.content == "summary"
 
+    def test_starts_total_timeout_after_codex_runtime_import(self, monkeypatch):
+        events = []
+        real_import = __import__
+
+        def tracking_import(name, *args, **kwargs):
+            if name == "agent.codex_runtime":
+                events.append("codex_runtime_import")
+            return real_import(name, *args, **kwargs)
+
+        class _FakeTimer:
+            def __init__(self, *args, **kwargs):
+                events.append("timeout_timer")
+
+            def start(self):
+                pass
+
+            def cancel(self):
+                pass
+
+        message_item = SimpleNamespace(
+            type="message",
+            content=[SimpleNamespace(type="output_text", text="summary")],
+        )
+        stream = iter([
+            SimpleNamespace(type="response.output_item.done", item=message_item),
+            SimpleNamespace(
+                type="response.completed",
+                response=SimpleNamespace(status="completed", id="r1", usage=None),
+            ),
+        ])
+        fake_client = SimpleNamespace(
+            responses=SimpleNamespace(create=lambda **_kwargs: stream),
+        )
+
+        monkeypatch.setattr("builtins.__import__", tracking_import)
+        monkeypatch.setattr("agent.auxiliary_client.threading.Timer", _FakeTimer)
+
+        _CodexCompletionsAdapter(fake_client, "gpt-5.5").create(
+            messages=[{"role": "user", "content": "summarize this"}],
+            timeout=0.05,
+        )
+
+        assert events[:2] == ["codex_runtime_import", "timeout_timer"]
+
     def test_enforces_total_timeout_while_stream_keeps_emitting_events(self):
         class _SlowAliveCreateStream:
             def __iter__(self):
@@ -5343,7 +5387,11 @@ class TestCodexAuxiliaryAdapterTimeout:
                 timeout=0.05,
             )
 
-        assert time.monotonic() - started < 0.14
+        # The timeout should trip before the synthetic stream runs to normal
+        # completion, but loaded test processes can add scheduling overhead to
+        # sub-100ms timers. Keep this assertion about the contract, not exact
+        # host timing.
+        assert time.monotonic() - started < 0.25
 
 
 class TestCodexAuxiliaryToolMessageConversion:

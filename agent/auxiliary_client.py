@@ -1181,6 +1181,12 @@ class _CodexCompletionsAdapter:
                 # new failure mode for auxiliary calls.
                 pass
 
+        # Import before starting the timeout budget. A cold import can take a
+        # meaningful fraction of tiny test/auxiliary budgets, and the contract
+        # we need to enforce is provider stream wall time, not local module-load
+        # time.
+        from agent.codex_runtime import _consume_codex_event_stream
+
         try:
             if total_timeout:
                 timeout_timer = threading.Timer(float(total_timeout), _close_client_on_timeout)
@@ -1198,7 +1204,6 @@ class _CodexCompletionsAdapter:
             # Consuming raw events and assembling the final response
             # ourselves from ``response.output_item.done`` makes us
             # structurally immune to that drift.
-            from agent.codex_runtime import _consume_codex_event_stream
 
             stream_kwargs = dict(resp_kwargs)
             stream_kwargs["stream"] = True
