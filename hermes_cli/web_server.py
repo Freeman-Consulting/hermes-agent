@@ -18688,6 +18688,64 @@ async def console_ws(ws: WebSocket) -> None:
                 pass
 
 
+def _desktop_terminal_shell() -> tuple[list[str], str]:
+    resolved = os.environ.get("SHELL") or next(
+        (candidate for candidate in ("/bin/zsh", "/bin/bash", "/bin/sh") if Path(candidate).exists()),
+        "/bin/sh",
+    )
+    name = Path(resolved).name.lower()
+    return [resolved, "-il" if name in {"zsh", "bash"} else "-i"], name
+
+
+def _desktop_terminal_cwd(value: Any) -> str:
+    candidate = Path(str(value or Path.home())).expanduser()
+    if not candidate.is_absolute():
+        candidate = Path.cwd() / candidate
+    try:
+        resolved = candidate.resolve()
+        if resolved.is_dir():
+            return str(resolved)
+        if resolved.is_file():
+            return str(resolved.parent)
+    except OSError:
+        pass
+    return str(Path.home())
+
+
+@app.websocket("/api/terminal")
+async def desktop_terminal_ws(ws: WebSocket) -> None:
+    peer = ws.client.host if ws.client else "?"
+    auth_reason, cred, _ = _ws_auth_reason(ws)
+    if auth_reason is not None:
+        _log.warning("terminal auth rejected reason=%s cred=%s peer=%s", auth_reason, cred, peer)
+        await ws.close(code=4401, reason=_ws_close_reason(f"auth: {auth_reason}"))
+        return
+    request_reason = _ws_request_reason(ws)
+    if request_reason is not None:
+        _log.warning("terminal refused: %s peer=%s", request_reason, peer)
+        await ws.close(code=4403, reason=_ws_close_reason(request_reason))
+        return
+    await ws.accept()
+    bridge_cls = PtyBridge
+    if not _PTY_BRIDGE_AVAILABLE or bridge_cls is None:
+        await ws.send_text("\r\n\x1b[31mRemote terminal unavailable: PTY support is not installed.\x1b[0m\r\n")
+        await ws.close(code=1011)
+        return
+    argv, _ = _desktop_terminal_shell()
+    cwd = _desktop_terminal_cwd(ws.query_params.get("cwd"))
+    env = os.environ.copy()
+    env.update({"TERM": "xterm-256color", "COLORTERM": "truecolor", "TERM_PROGRAM": "Hermes", "HERMES_DESKTOP_TERMINAL": "1"})
+    cols = max(2, min(2000, int(ws.query_params.get("cols") or 80)))
+    rows = max(2, min(1000, int(ws.query_params.get("rows") or 24)))
+    try:
+        bridge = await asyncio.to_thread(bridge_cls.spawn, argv, cwd=cwd, env=env, cols=cols, rows=rows)
+    except (PtyUnavailableError, FileNotFoundError, OSError) as exc:
+        await ws.send_text(f"\r\n\x1b[31mRemote terminal failed to start: {exc}\x1b[0m\r\n")
+        await ws.close(code=1011)
+        return
+    await _legacy_pump(ws, bridge)
+
+
 @app.websocket("/api/pty")
 async def pty_ws(ws: WebSocket) -> None:
     peer = ws.client.host if ws.client else "?"
