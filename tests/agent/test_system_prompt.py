@@ -25,6 +25,7 @@ def _make_agent(**overrides):
         pass_session_id=False,
         session_id="",
         skills_loading_mode="eager",
+        _emit_status=lambda _message: None,
     )
     base.update(overrides)
     return SimpleNamespace(**base)
