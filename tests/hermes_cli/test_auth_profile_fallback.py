@@ -80,6 +80,30 @@ def test_profile_with_zero_entries_falls_back_to_global(profile_env):
     assert entries[0]["access_token"] == "sk-or-global"
 
 
+def test_profile_can_disable_global_credential_pool_fallback(profile_env):
+    """Security-sensitive profiles can refuse every root pool credential."""
+    from hermes_cli.auth import read_credential_pool
+
+    _write(profile_env["global"] / "auth.json", _make_auth_store(pool={
+        "xai-oauth": [{
+            "id": "global-xai",
+            "label": "global-xai",
+            "auth_type": "oauth",
+            "priority": 0,
+            "source": "manual",
+            "access_token": "global-access",
+            "refresh_token": "global-refresh",
+        }],
+    }))
+    _write(profile_env["profile"] / "auth.json", _make_auth_store(pool={}))
+    (profile_env["profile"] / "config.yaml").write_text(
+        "auth:\n  global_fallback: false\n"
+    )
+
+    assert read_credential_pool("xai-oauth") == []
+    assert read_credential_pool(None) == {}
+
+
 def test_profile_with_entries_fully_shadows_global(profile_env):
     """Once the profile has any entries for a provider, global is ignored."""
     from hermes_cli.auth import read_credential_pool
@@ -251,6 +275,21 @@ def test_provider_auth_state_falls_back_to_global_when_profile_has_none(profile_
     state = get_provider_auth_state("nous")
     assert state is not None
     assert state["access_token"] == "nous-global"
+
+
+def test_profile_can_disable_global_provider_state_fallback(profile_env):
+    """The same opt-out covers singleton provider state, not only pools."""
+    from hermes_cli.auth import get_provider_auth_state
+
+    _write(profile_env["global"] / "auth.json", _make_auth_store(providers={
+        "nous": {"access_token": "nous-global", "refresh_token": "rt-global"},
+    }))
+    _write(profile_env["profile"] / "auth.json", _make_auth_store(providers={}))
+    (profile_env["profile"] / "config.yaml").write_text(
+        "auth:\n  global_fallback: false\n"
+    )
+
+    assert get_provider_auth_state("nous") is None
 
 
 def test_provider_auth_state_profile_wins_when_present(profile_env):
