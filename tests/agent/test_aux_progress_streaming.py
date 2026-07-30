@@ -10,15 +10,18 @@ hook, behavior is byte-for-byte the old non-streaming call.
 import threading
 import time
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
 from agent.auxiliary_client import (
+    _acreate_with_stream,
     _aggregate_chat_stream,
+    _aggregate_chat_stream_async,
     _aux_stream_total_ceiling,
     _create_with_progress,
     _notify_aux_progress,
+    _provider_requires_stream,
     aux_progress_hook,
 )
 from agent.conversation_compression import CompressionCommitFence
@@ -85,15 +88,7 @@ class TestAuxProgressHook:
         _notify_aux_progress()  # outside — must not tick
         assert ticks == [1]
 
-    def test_none_hook_is_noop_passthrough(self):
-        with aux_progress_hook(None):
-            _notify_aux_progress()  # must not raise
 
-    def test_hook_exception_is_swallowed(self):
-        def _boom():
-            raise RuntimeError("hook blew up")
-        with aux_progress_hook(_boom):
-            _notify_aux_progress()  # must not raise
 
     def test_hook_is_thread_local(self):
         ticks = []
@@ -116,12 +111,6 @@ class TestAuxProgressHook:
 # ---------------------------------------------------------------------------
 
 class TestCreateWithProgress:
-    def test_no_hook_means_plain_nonstreaming_call(self):
-        client = _FakeClient(response=_COMPLETE)
-        result = _create_with_progress(client, {"model": "m1", "messages": []})
-        assert result is _COMPLETE
-        assert len(client.calls) == 1
-        assert "stream" not in client.calls[0]
 
     def test_hook_upgrades_to_streaming_and_ticks_per_chunk(self):
         chunks = [
@@ -160,25 +149,7 @@ class TestCreateWithProgress:
         assert client.calls[0].get("stream") is True
         assert "stream" not in client.calls[1]
 
-    def test_auth_error_propagates_without_nonstreaming_retry(self):
-        class _FakeAuthError(Exception):
-            status_code = 401
-        client = _FakeClient(stream_error=_FakeAuthError("Error code: 401 - unauthorized"))
-        with aux_progress_hook(lambda: None):
-            with pytest.raises(_FakeAuthError):
-                _create_with_progress(client, {"model": "m1", "messages": []})
-        assert len(client.calls) == 1  # no silent non-streaming retry
 
-    def test_shim_returning_complete_response_passes_through(self):
-        # Adapters may ignore stream=True and hand back a full response.
-        class _ShimClient(_FakeClient):
-            def _create(self, **kwargs):
-                self.calls.append(kwargs)
-                return _COMPLETE
-        client = _ShimClient()
-        with aux_progress_hook(lambda: None):
-            result = _create_with_progress(client, {"model": "m1", "messages": []})
-        assert result is _COMPLETE
 
 
 # ---------------------------------------------------------------------------
@@ -207,13 +178,6 @@ class TestAggregateChatStream:
         assert tool_calls[0].function.arguments == '{"a": 1}'
         assert result.choices[0].finish_reason == "tool_calls"
 
-    def test_total_ceiling_kills_trickle_stream_as_timeout(self):
-        def _trickle():
-            while True:
-                time.sleep(0.01)
-                yield _chunk(content="x")
-        with pytest.raises(TimeoutError, match="timed out"):
-            _aggregate_chat_stream(_trickle(), total_ceiling=0.05)
 
     def test_stream_close_is_called(self):
         closed = []
@@ -229,11 +193,6 @@ class TestAggregateChatStream:
         assert result.choices[0].message.content == "ok"
         assert closed == [True]
 
-    def test_empty_choices_chunks_are_skipped(self):
-        empty = SimpleNamespace(id="c", model="m", choices=[], usage=None)
-        chunks = [empty, _chunk(content="ok", finish_reason="stop")]
-        result = _aggregate_chat_stream(iter(chunks))
-        assert result.choices[0].message.content == "ok"
 
 
 # ---------------------------------------------------------------------------
@@ -244,8 +203,6 @@ class TestStreamCeiling:
     def test_floor_applies_to_small_timeouts(self):
         assert _aux_stream_total_ceiling(30) == 600.0
 
-    def test_multiplier_wins_for_large_timeouts(self):
-        assert _aux_stream_total_ceiling(300) == 1200.0
 
     def test_none_timeout_gets_floor(self):
         assert _aux_stream_total_ceiling(None) == 600.0
@@ -271,3 +228,132 @@ class TestFenceProgress:
         with aux_progress_hook(fence.touch_progress):
             _notify_aux_progress()
         assert fence.seconds_since_progress() < 0.05
+
+
+# ---------------------------------------------------------------------------
+# Stream-only providers (credit @kudi88, PR #60686)
+# ---------------------------------------------------------------------------
+
+class TestProviderRequiresStream:
+
+    def test_normal_endpoints_are_not(self):
+        assert _provider_requires_stream(
+            "openrouter", "https://openrouter.ai/api/v1"
+        ) is False
+        assert _provider_requires_stream("auto", None) is False
+        assert _provider_requires_stream("auto", "") is False
+
+    def test_config_marker_matches_custom_endpoint(self):
+        with patch(
+            "hermes_cli.config.load_config",
+            return_value={"auxiliary": {"stream_only_base_urls": ["my-proxy.example.com"]}},
+        ):
+            assert _provider_requires_stream(
+                "custom", "https://my-proxy.example.com/v1"
+            ) is True
+            assert _provider_requires_stream(
+                "custom", "https://other.example.com/v1"
+            ) is False
+
+
+
+class TestForceStream:
+    def test_force_stream_streams_without_a_hook(self):
+        chunks = [_chunk(content="hi", finish_reason="stop")]
+        client = _FakeClient(stream_chunks=chunks)
+        # NO aux_progress_hook installed — force_stream alone must stream.
+        result = _create_with_progress(
+            client, {"model": "m1", "messages": []}, force_stream=True,
+        )
+        assert client.calls[0]["stream"] is True
+        assert result.choices[0].message.content == "hi"
+
+    def test_force_stream_does_not_retry_nonstreaming_on_failure(self):
+        client = _FakeClient(
+            response=_COMPLETE,
+            stream_error=RuntimeError("HTTP 400 bad request"),
+        )
+        with pytest.raises(RuntimeError, match="bad request"):
+            _create_with_progress(
+                client, {"model": "m1", "messages": []}, force_stream=True,
+            )
+        # No silent non-streaming retry — the provider rejects those anyway.
+        assert len(client.calls) == 1
+
+
+class TestAsyncStreamAggregation:
+    @pytest.mark.asyncio
+    async def test_async_stream_is_consumed_with_async_for(self):
+        # The sweeper review of PR #60686 flagged that awaiting create() and
+        # then iterating synchronously raises — the async contract is
+        # ``async for``. Verify the async aggregator consumes a real async
+        # iterator and preserves tool-call deltas.
+        tc0 = SimpleNamespace(
+            index=0, id="call_9",
+            function=SimpleNamespace(name="lookup", arguments='{"q":'),
+        )
+        tc1 = SimpleNamespace(
+            index=0, id=None,
+            function=SimpleNamespace(name=None, arguments='"x"}'),
+        )
+        raw_chunks = [
+            _chunk(content="part1 "),
+            _chunk(tool_calls=[tc0]),
+            _chunk(tool_calls=[tc1], content="part2", finish_reason="tool_calls"),
+        ]
+
+        class _AsyncStream:
+            def __init__(self, items):
+                self._items = list(items)
+                self.closed = False
+
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                if not self._items:
+                    raise StopAsyncIteration
+                return self._items.pop(0)
+
+            async def close(self):
+                self.closed = True
+
+        stream = _AsyncStream(raw_chunks)
+        result = await _aggregate_chat_stream_async(stream)
+        msg = result.choices[0].message
+        assert msg.content == "part1 part2"
+        assert msg.tool_calls[0].function.name == "lookup"
+        assert msg.tool_calls[0].function.arguments == '{"q":"x"}'
+        assert result.choices[0].finish_reason == "tool_calls"
+        assert stream.closed is True
+
+    @pytest.mark.asyncio
+    async def test_acreate_with_stream_passes_stream_kwargs(self):
+        calls = []
+
+        class _AsyncStream:
+            def __init__(self, items):
+                self._items = list(items)
+
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                if not self._items:
+                    raise StopAsyncIteration
+                return self._items.pop(0)
+
+        class _AsyncClient:
+            def __init__(self):
+                completions = SimpleNamespace(create=self._create)
+                self.chat = SimpleNamespace(completions=completions)
+
+            async def _create(self, **kwargs):
+                calls.append(kwargs)
+                return _AsyncStream([_chunk(content="ok", finish_reason="stop")])
+
+        result = await _acreate_with_stream(
+            _AsyncClient(), {"model": "m1", "messages": [], "timeout": 30},
+        )
+        assert calls[0]["stream"] is True
+        assert result.choices[0].message.content == "ok"

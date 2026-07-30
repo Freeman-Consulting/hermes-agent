@@ -84,14 +84,15 @@ class AuditEvent(enum.Enum):
 
 
 def _resolve_log_path() -> Path:
-    """``$HERMES_HOME/logs/dashboard-auth.log`` with the standard fallback.
+    """``$HERMES_HOME/logs/dashboard-auth.log``.
 
-    Mirrors ``hermes_constants.get_hermes_home`` semantics: env var wins,
-    else ``~/.hermes``. A local copy avoids an import cycle with the
-    middleware which lives below ``hermes_cli``.
+    Uses ``hermes_constants.get_hermes_home()`` (a leaf module — no import
+    cycle) so profile overrides and the native-Windows ``%LOCALAPPDATA%``
+    fallback are honored.
     """
-    home = os.environ.get("HERMES_HOME") or str(Path.home() / ".hermes")
-    return Path(home) / "logs" / "dashboard-auth.log"
+    from hermes_constants import get_hermes_home
+
+    return get_hermes_home() / "logs" / "dashboard-auth.log"
 
 
 def _normalize_field_name(name: str) -> str:
