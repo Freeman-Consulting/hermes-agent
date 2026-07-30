@@ -26,6 +26,26 @@ describe('subagent store', () => {
     expect(item?.summary).toBe('done')
   })
 
+  it.each([
+    ['timeout', 'failed'],
+    ['error', 'failed'],
+    ['cancelled', 'interrupted'],
+    ['canceled', 'interrupted']
+  ] as const)('normalizes backend %s status as terminal %s', (backendStatus, expectedStatus) => {
+    upsertSubagent('s1', { goal: 'review', status: 'running', subagent_id: 'a1', task_index: 0 })
+    upsertSubagent(
+      's1',
+      { goal: 'review', status: backendStatus, subagent_id: 'a1', summary: 'stopped', task_index: 0 },
+      false,
+      'subagent.complete'
+    )
+    upsertSubagent('s1', { status: 'running', subagent_id: 'a1', task_index: 0, text: 'late update' })
+
+    expect(listFor('s1')[0]?.status).toBe(expectedStatus)
+    expect(activeSubagentCount(listFor('s1'))).toBe(0)
+    expect(failedSubagentCount(listFor('s1'))).toBe(1)
+  })
+
   it('builds parent/child trees', () => {
     upsertSubagent('s1', { goal: 'parent', status: 'running', subagent_id: 'p', task_index: 0 })
     upsertSubagent('s1', { goal: 'child', parent_id: 'p', status: 'queued', subagent_id: 'c', task_index: 1 })
