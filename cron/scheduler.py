@@ -5928,9 +5928,12 @@ def run_job(
         # Model resolution precedence: per-job override > cron.model (the
         # cron-fleet default) > HERMES_MODEL env > config.yaml ``model:``
         # (string or ``{default: ...}``). The per-job value is intentionally
-        # re-read from storage every tick so a ``hermes cron edit --model``
-        # after a failed run takes effect on the next tick — there is no
-        # in-memory cache.
+        # re-read from storage every tick so either a user-owned
+        # ``hermes cron edit --model`` or an agent-owned ``cronjob`` update
+        # takes effect on the next tick — there is no in-memory cache. After
+        # selecting the value, canonical top-level ``model_aliases`` are
+        # resolved at fire time. This lets a cron pin a stable capability name
+        # while its concrete provider/model assignment changes centrally.
         model = job.get("model") or os.getenv("HERMES_MODEL") or ""
 
         # cron.model / cron.model_provider: a deliberate cron-fleet default
@@ -5939,6 +5942,9 @@ def run_job(
         # axis — following cron.model is explicit, not drift.
         _cron_default_model = ""
         _cron_default_provider = ""
+        _model_alias_name = ""
+        _model_alias_provider = ""
+        _model_alias_base_url = ""
 
         # Load config.yaml for model, reasoning, prefill, toolsets, provider routing
         _cfg = {}
@@ -5982,6 +5988,33 @@ def run_job(
                             model = _global_model
         except Exception as e:
             logger.warning("Job '%s': failed to load config.yaml, using defaults: %s", job_id, e)
+
+        # Resolve canonical direct model aliases without invoking catalog or
+        # network discovery. Explicit per-job provider/base_url values retain
+        # precedence over the alias's routing fields. Unknown or malformed
+        # aliases remain ordinary model IDs for backward compatibility.
+        if isinstance(model, str) and model.strip():
+            _alias_key = model.strip().lower()
+            _aliases = _cfg.get("model_aliases") if isinstance(_cfg, dict) else None
+            _alias_entry = _aliases.get(_alias_key) if isinstance(_aliases, dict) else None
+            if isinstance(_alias_entry, dict):
+                _alias_model = str(_alias_entry.get("model") or "").strip()
+                if _alias_model:
+                    _model_alias_name = _alias_key
+                    _model_alias_provider = str(
+                        _alias_entry.get("provider") or ""
+                    ).strip()
+                    _model_alias_base_url = str(
+                        _alias_entry.get("base_url") or ""
+                    ).strip()
+                    model = _alias_model
+                    logger.info(
+                        "Job '%s': model alias '%s' resolved to provider=%s model=%s",
+                        job_id,
+                        _model_alias_name,
+                        _model_alias_provider or "<configured default>",
+                        model,
+                    )
 
         # Fail fast if no model resolved from job / env / config.yaml: an empty
         # model otherwise reaches the provider as an opaque 400 (#23979).
@@ -6058,7 +6091,12 @@ def run_job(
         # job persisted before that guard — or written directly to the jobs store
         # — reaches this sink unchecked. Fail closed before resolution so no
         # off-host call is ever made with a stored key.
-        _guard_job_credential_exfil(job)
+        _guard_job = dict(job)
+        if not _guard_job.get("provider") and _model_alias_provider:
+            _guard_job["provider"] = _model_alias_provider
+        if not _guard_job.get("base_url") and _model_alias_base_url:
+            _guard_job["base_url"] = _model_alias_base_url
+        _guard_job_credential_exfil(_guard_job)
 
         # ---------------------------------------------------------------
         # Pre-dispatch configuration validation (T1-26).
@@ -6137,6 +6175,7 @@ def run_job(
         )
         primary_provider_for_drift = (
             str(job.get("provider") or "").strip().lower()
+            or _model_alias_provider.lower()
             or configured_provider_for_drift
             or None
         )
@@ -6146,19 +6185,26 @@ def run_job(
             # no explicit provider is requested. Passing the env var here short-
             # circuits that precedence and can resurrect old providers (for
             # example DeepSeek) for cron jobs that do not pin provider/model.
-            runtime_kwargs = {
+            runtime_kwargs: dict[str, Any] = {
                 # Per-job user pin wins; otherwise the cron-fleet default
                 # provider (cron.model_provider); otherwise resolve from
                 # persisted global config.
-                "requested": job.get("provider") or _cron_default_provider or None,
+                "requested": (
+                    job.get("provider")
+                    or _model_alias_provider
+                    or _cron_default_provider
+                    or None
+                ),
                 # Derive provider-specific api_mode from the model this job
                 # will actually run (per-job pin > env > config default), not
                 # the stale persisted default — mirrors the fallback path
                 # below, which already passes its fb_model.
                 "target_model": model,
             }
-            if job.get("base_url"):
-                runtime_kwargs["explicit_base_url"] = job.get("base_url")
+            if job.get("base_url") or _model_alias_base_url:
+                runtime_kwargs["explicit_base_url"] = (
+                    job.get("base_url") or _model_alias_base_url
+                )
             runtime = resolve_runtime_provider(**runtime_kwargs)
             primary_provider_for_drift = (
                 str(runtime.get("provider") or "").strip().lower()
@@ -6259,8 +6305,15 @@ def run_job(
                 primary_provider_for_drift or runtime.get("provider") or ""
             ).strip().lower()
             _current_model = str(primary_model_for_drift or "").strip().lower()
+            # A direct model alias is an explicit provider/model assignment even
+            # when the persisted job only stores the alias in ``model``. Mirror
+            # its provider into the drift-classifier view so the upstream helper
+            # does not misclassify that provider axis as an unpinned global drift.
+            _drift_job = dict(job)
+            if not _drift_job.get("provider") and _model_alias_provider:
+                _drift_job["provider"] = _model_alias_provider
             for _axis in cron_model_drift_axes(
-                job,
+                _drift_job,
                 current_provider=_current_provider,
                 current_model=_current_model,
                 config=_cfg,

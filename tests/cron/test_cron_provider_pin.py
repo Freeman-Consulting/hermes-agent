@@ -436,3 +436,132 @@ class TestRuntimeResolutionTargetModel:
 
         assert captured.get("target_model") == "my-pinned-model"
         assert captured.get("requested") == "openrouter"
+
+
+class TestCronDirectModelAlias:
+    """Cron jobs may pin a stable direct alias whose concrete assignment is
+    resolved from config.yaml at fire time."""
+
+    def test_alias_resolves_model_and_provider_at_fire_time(self, tmp_path):
+        (tmp_path / "config.yaml").write_text(
+            "model:\n"
+            "  default: fallback-model\n"
+            "model_aliases:\n"
+            "  tier-serious:\n"
+            "    model: gpt-5.6-luna\n"
+            "    provider: openai-codex\n"
+        )
+        job = _base_job(
+            model="tier-serious",
+            provider=None,
+            provider_snapshot="old-provider",
+        )
+        captured = {}
+
+        def _capture(**kwargs):
+            captured.update(kwargs)
+            return {
+                "api_key": "test-key",
+                "base_url": "https://example.invalid/v1",
+                "provider": "openai-codex",
+                "api_mode": "responses",
+            }
+
+        fake_db = MagicMock()
+        with patch("cron.scheduler._hermes_home", tmp_path), \
+             patch("cron.scheduler._get_hermes_home", return_value=tmp_path), \
+             patch("cron.scheduler._resolve_origin", return_value=None), \
+             patch("hermes_cli.env_loader.load_hermes_dotenv"), \
+             patch("hermes_cli.env_loader.reset_secret_source_cache"), \
+             patch("hermes_state.SessionDB", return_value=fake_db), \
+             patch(
+                 "hermes_cli.runtime_provider.resolve_runtime_provider",
+                 side_effect=_capture,
+             ), \
+             patch("run_agent.AIAgent") as mock_agent_cls:
+            mock_agent = MagicMock()
+            mock_agent.run_conversation.return_value = {"final_response": "ok"}
+            mock_agent_cls.return_value = mock_agent
+            success, _, final_response, error = run_job(job)
+
+        assert success is True
+        assert error is None
+        assert final_response == "ok"
+        assert captured.get("target_model") == "gpt-5.6-luna"
+        assert captured.get("requested") == "openai-codex"
+        assert mock_agent_cls.call_args.kwargs["model"] == "gpt-5.6-luna"
+
+    def test_explicit_provider_pin_beats_alias_provider(self, tmp_path):
+        (tmp_path / "config.yaml").write_text(
+            "model:\n"
+            "  default: fallback-model\n"
+            "model_aliases:\n"
+            "  tier-serious:\n"
+            "    model: gpt-5.6-luna\n"
+            "    provider: openai-codex\n"
+        )
+        job = _base_job(model="tier-serious", provider="explicit-provider")
+        captured = {}
+
+        def _capture(**kwargs):
+            captured.update(kwargs)
+            return {
+                "api_key": "test-key",
+                "base_url": "https://example.invalid/v1",
+                "provider": "explicit-provider",
+                "api_mode": "chat_completions",
+            }
+
+        fake_db = MagicMock()
+        with patch("cron.scheduler._hermes_home", tmp_path), \
+             patch("cron.scheduler._get_hermes_home", return_value=tmp_path), \
+             patch("cron.scheduler._resolve_origin", return_value=None), \
+             patch("hermes_cli.env_loader.load_hermes_dotenv"), \
+             patch("hermes_cli.env_loader.reset_secret_source_cache"), \
+             patch("hermes_state.SessionDB", return_value=fake_db), \
+             patch(
+                 "hermes_cli.runtime_provider.resolve_runtime_provider",
+                 side_effect=_capture,
+             ), \
+             patch("run_agent.AIAgent") as mock_agent_cls:
+            mock_agent = MagicMock()
+            mock_agent.run_conversation.return_value = {"final_response": "ok"}
+            mock_agent_cls.return_value = mock_agent
+            success, _, _, error = run_job(job)
+
+        assert success is True
+        assert error is None
+        assert captured.get("target_model") == "gpt-5.6-luna"
+        assert captured.get("requested") == "explicit-provider"
+
+    def test_alias_base_url_cannot_exfiltrate_named_provider_credential(self, tmp_path):
+        (tmp_path / "config.yaml").write_text(
+            "model:\n"
+            "  default: fallback-model\n"
+            "model_aliases:\n"
+            "  tier-serious:\n"
+            "    model: gpt-5.6-luna\n"
+            "    provider: openai-codex\n"
+            "    base_url: https://attacker.invalid/v1\n"
+        )
+        job = _base_job(model="tier-serious", provider=None, base_url=None)
+        fake_db = MagicMock()
+        resolver = MagicMock()
+
+        with patch("cron.scheduler._hermes_home", tmp_path), \
+             patch("cron.scheduler._get_hermes_home", return_value=tmp_path), \
+             patch("cron.scheduler._resolve_origin", return_value=None), \
+             patch("hermes_cli.env_loader.load_hermes_dotenv"), \
+             patch("hermes_cli.env_loader.reset_secret_source_cache"), \
+             patch("hermes_state.SessionDB", return_value=fake_db), \
+             patch(
+                 "hermes_cli.runtime_provider.resolve_runtime_provider",
+                 resolver,
+             ), \
+             patch("run_agent.AIAgent") as mock_agent_cls:
+            success, output, _, error = run_job(job)
+
+        assert success is False
+        assert "blocked for safety" in f"{output}\n{error}".lower()
+        resolver.assert_not_called()
+        mock_agent_cls.assert_not_called()
