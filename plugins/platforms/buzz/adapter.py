@@ -3118,6 +3118,7 @@ def _apply_yaml_config(yaml_cfg: dict, buzz_cfg: dict) -> Optional[dict]:
         "cli_path": "BUZZ_CLI_PATH",
         "home_channel": "BUZZ_HOME_CHANNEL",
         "transport": "BUZZ_TRANSPORT",
+        "credentials_file": "BUZZ_CREDENTIALS_FILE",
     }
     for src, env in _str_keys.items():
         val = extra.get(src)

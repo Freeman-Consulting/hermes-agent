@@ -1152,6 +1152,26 @@ def _global_auth_file_path() -> Optional[Path]:
 
     See issue #18594 follow-up (credential_pool shadowing).
     """
+    # Named profiles inherit root credentials by default for backward
+    # compatibility. Security-sensitive/service profiles can opt out in their
+    # own config.yaml:
+    #
+    #   auth:
+    #     global_fallback: false
+    #
+    # Keep this gate at the path resolver so every global read and OAuth
+    # refresh write-through observes the same boundary.
+    try:
+        raw_config = read_raw_config()
+        auth_config = raw_config.get("auth") if isinstance(raw_config, dict) else None
+        if isinstance(auth_config, dict) and not is_truthy_value(
+            auth_config.get("global_fallback"), default=True
+        ):
+            return None
+    except Exception:
+        # A malformed/unreadable config must preserve the historical default.
+        logger.debug("Failed to read auth.global_fallback; preserving fallback", exc_info=True)
+
     try:
         from hermes_constants import get_default_hermes_root
         global_root = get_default_hermes_root()
