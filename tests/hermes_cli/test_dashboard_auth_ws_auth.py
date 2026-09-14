@@ -201,11 +201,29 @@ def _fake_ws(
 
 
 class TestWsAuthOkLoopback:
-    """Gate OFF — legacy token path."""
+    """Gate OFF — legacy token path plus audience-bound mobile tickets."""
 
     def test_correct_token_accepted(self, loopback_app):
         ws = _fake_ws(query={"token": web_server._SESSION_TOKEN})
         assert web_server._ws_auth_ok(ws) is True
+
+    def test_wrong_token_rejected(self, loopback_app):
+        ws = _fake_ws(query={"token": "not-the-real-token"})
+        assert web_server._ws_auth_ok(ws) is False
+
+    def test_missing_token_rejected(self, loopback_app):
+        ws = _fake_ws(query={})
+        assert web_server._ws_auth_ok(ws) is False
+
+    def test_mobile_ticket_accepted_for_api_ws_in_loopback(self, loopback_app):
+        ticket = mint_ticket(user_id="mobile:ios_1", provider="mobile-device", audience="/api/ws")
+        ws = _fake_ws(query={"ticket": ticket}, path="/api/ws")
+        assert web_server._ws_auth_ok(ws) is True
+
+    def test_mobile_ticket_rejected_for_pty_in_loopback(self, loopback_app):
+        ticket = mint_ticket(user_id="mobile:ios_1", provider="mobile-device", audience="/api/ws")
+        ws = _fake_ws(query={"ticket": ticket}, path="/api/pty")
+        assert web_server._ws_auth_ok(ws) is False
 
 
 class TestWsAuthOkGated:

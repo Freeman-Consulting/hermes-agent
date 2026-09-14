@@ -10,7 +10,7 @@ from __future__ import annotations
 import math
 from typing import Any, Dict, List, Literal, Optional
 
-from pydantic import BaseModel, SecretStr, field_validator
+from pydantic import BaseModel, Field, SecretStr, field_validator
 
 
 # --- from web_server.py (originally lines 1273-1372) ---
@@ -90,6 +90,50 @@ class WhatsAppOnboardingApply(BaseModel):
     mode: Optional[str] = None
     allowed_users: Optional[str] = None
     profile: Optional[str] = None
+
+
+class MobilePairingCodeRequest(BaseModel):
+    device_name: Optional[str] = None
+
+    @field_validator("device_name")
+    @classmethod
+    def _device_name_bound(cls, v: Optional[str]) -> Optional[str]:
+        if v is not None and len(v) > 80:
+            raise ValueError("device_name exceeds 80 characters")
+        return v
+
+
+class MobilePairRequest(BaseModel):
+    code: str
+    device_name: Optional[str] = None
+
+    @field_validator("code")
+    @classmethod
+    def _code_bound(cls, v: str) -> str:
+        from hermes_cli.dashboard_auth.mobile_devices import (
+            PAIRING_CODE_ALPHABET,
+            _normalize_code,
+        )
+        if len(v) > 32:
+            raise ValueError("pairing code raw input exceeds 32 characters")
+        normalized = _normalize_code(v)
+        if len(normalized) != 8:
+            raise ValueError("pairing code must normalize to exactly 8 characters")
+        if not all(ch in PAIRING_CODE_ALPHABET for ch in normalized):
+            raise ValueError("pairing code contains invalid characters")
+        return v
+
+    @field_validator("device_name")
+    @classmethod
+    def _device_name_bound(cls, v: Optional[str]) -> Optional[str]:
+        if v is not None and len(v) > 80:
+            raise ValueError("device_name exceeds 80 characters")
+        return v
+
+
+class MobileWsTicketRequest(BaseModel):
+    device_id: str = Field(min_length=1, max_length=64)
+    device_secret: str = Field(min_length=1, max_length=256)
 
 
 class AudioTranscriptionRequest(BaseModel):

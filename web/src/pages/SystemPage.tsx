@@ -58,6 +58,9 @@ import type {
   UpdateCheckResponse,
   CuratorStatus,
   PortalStatus,
+  MobileOpsStatus,
+  MobilePairingCodeResponse,
+  MobileDevice,
   DebugShareResponse,
 } from "@/lib/api";
 
@@ -203,6 +206,11 @@ export default function SystemPage() {
   const [hooks, setHooks] = useState<HooksResponse | null>(null);
   const [curator, setCurator] = useState<CuratorStatus | null>(null);
   const [portal, setPortal] = useState<PortalStatus | null>(null);
+  const [mobileOps, setMobileOps] = useState<MobileOpsStatus | null>(null);
+  const [mobilePairing, setMobilePairing] =
+    useState<MobilePairingCodeResponse | null>(null);
+  const [creatingMobilePairing, setCreatingMobilePairing] = useState(false);
+  const [mobileDevices, setMobileDevices] = useState<MobileDevice[]>([]);
   const [loading, setLoading] = useState(true);
 
   const [activeAction, setActiveAction] = useState<string | null>(null);
@@ -263,11 +271,13 @@ export default function SystemPage() {
       api.getHooks(),
       api.getCurator(),
       api.getPortal(),
+      api.getMobileOpsStatus(),
+      api.getMobileDevices(),
       // Cached (non-forced) check so the version row shows update status on
       // load without a separate effect / a forced network round-trip.
       api.checkHermesUpdate(false),
     ])
-      .then(([s, st, m, p, c, h, cur, prt, upd]) => {
+      .then(([s, st, m, p, c, h, cur, prt, mo, devices, upd]) => {
         if (s.status === "fulfilled") setStatus(s.value);
         if (st.status === "fulfilled") setStats(st.value);
         if (m.status === "fulfilled") setMemory(m.value);
@@ -276,6 +286,8 @@ export default function SystemPage() {
         if (h.status === "fulfilled") setHooks(h.value);
         if (cur.status === "fulfilled") setCurator(cur.value);
         if (prt.status === "fulfilled") setPortal(prt.value);
+        if (mo.status === "fulfilled") setMobileOps(mo.value);
+        if (devices.status === "fulfilled") setMobileDevices(devices.value);
         if (upd.status === "fulfilled") setUpdateInfo(upd.value);
       })
       .finally(() => setLoading(false));
@@ -284,6 +296,19 @@ export default function SystemPage() {
   useEffect(() => {
     loadAll();
   }, [loadAll]);
+
+  const createMobilePairingCode = async () => {
+    setCreatingMobilePairing(true);
+    try {
+      const pairing = await api.createMobilePairingCode("iPhone");
+      setMobilePairing(pairing);
+      showToast("Mobile pairing code created", "success");
+    } catch (e) {
+      showToast(`Could not create mobile pairing code: ${e}`, "error");
+    } finally {
+      setCreatingMobilePairing(false);
+    }
+  };
 
   // ── Gateway lifecycle ──────────────────────────────────────────────
   const runGateway = async (verb: "start" | "stop" | "restart") => {
@@ -628,6 +653,22 @@ export default function SystemPage() {
     ),
   });
 
+  const mobileDeviceRevoke = useConfirmDelete({
+    onDelete: useCallback(
+      async (deviceId: string) => {
+        try {
+          await api.revokeMobileDevice(deviceId);
+          showToast("Mobile device revoked", "success");
+          loadAll();
+        } catch (e) {
+          showToast(`Failed to revoke mobile device: ${e}`, "error");
+          throw e;
+        }
+      },
+      [loadAll, showToast],
+    ),
+  });
+
   if (loading) {
     return (
       <div className="flex items-center justify-center py-24">
@@ -702,6 +743,14 @@ export default function SystemPage() {
         title="Remove shell hook"
         description="Remove this hook from config and revoke its consent? It stops firing on the next restart."
         loading={hookDelete.isDeleting}
+      />
+      <DeleteConfirmDialog
+        open={mobileDeviceRevoke.isOpen}
+        onCancel={mobileDeviceRevoke.cancel}
+        onConfirm={mobileDeviceRevoke.confirm}
+        title="Revoke mobile device"
+        description="Revoke this device credential immediately? The phone will need a new pairing code before it can connect again."
+        loading={mobileDeviceRevoke.isDeleting}
       />
       <HermesConsoleModal
         open={consoleOpen}
@@ -998,6 +1047,240 @@ export default function SystemPage() {
                 Log in with <span className="font-mono">hermes portal</span>.
               </p>
             )}
+          </CardContent>
+        </Card>
+      </section>
+
+      {/* ── Mobile health ─────────────────────────────────────────── */}
+      <section className="flex flex-col gap-3">
+        <H2 variant="sm" className="flex items-center gap-2 text-muted-foreground">
+          <Share2 className="h-4 w-4" /> Mobile health
+        </H2>
+        <Card>
+          <CardContent className="py-4">
+            <div className="grid grid-cols-2 gap-4">
+              {/* Overall health */}
+              <div>
+                <div className="text-xs text-muted-foreground mb-1">Health</div>
+                <Badge
+                  tone={
+                    mobileOps?.overall_health === "healthy"
+                      ? "success"
+                      : mobileOps?.overall_health === "degraded"
+                      ? "warning"
+                      : "destructive"
+                  }
+                >
+                  {mobileOps?.overall_health ?? "–"}
+                </Badge>
+              </div>
+              {/* Devices */}
+              <div>
+                <div className="text-xs text-muted-foreground mb-1">Devices</div>
+                <div className="text-2xl">
+                  {mobileOps?.active_device_count ?? "–"}
+                </div>
+                <div className="text-xs text-muted-foreground">
+                  active · {mobileOps?.revoked_device_count ?? 0} revoked
+                </div>
+              </div>
+              {/* Runtime version/commit */}
+              <div>
+                <div className="text-xs text-muted-foreground mb-1">Runtime</div>
+                <div className="font-mono text-xs">
+                  v{mobileOps?.runtime_version ?? "–"}
+                  {mobileOps?.runtime_commit && (
+                    <span className="text-muted-foreground">
+                      {" "}
+                      ({mobileOps.runtime_commit})
+                    </span>
+                  )}
+                </div>
+              </div>
+              {/* DB integrity */}
+              <div>
+                <div className="text-xs text-muted-foreground mb-1">DB integrity</div>
+                <div className="flex items-center gap-2">
+                  <Badge
+                    tone={
+                      mobileOps?.integrity_ok === true
+                        ? "success"
+                        : mobileOps?.integrity_ok === false
+                        ? "destructive"
+                        : "secondary"
+                    }
+                  >
+                    {mobileOps?.integrity_ok === true
+                      ? "ok"
+                      : mobileOps?.integrity_ok === false
+                      ? "failed"
+                      : "checking"}
+                  </Badge>
+                  {mobileOps?.integrity_check_ts && (
+                    <span className="text-xs text-muted-foreground">
+                      {new Date(mobileOps.integrity_check_ts).toLocaleTimeString()}
+                    </span>
+                  )}
+                </div>
+              </div>
+              {/* Schema */}
+              <div>
+                <div className="text-xs text-muted-foreground mb-1">Schema</div>
+                <div className="font-mono text-sm">
+                  {mobileOps?.registry_backend ?? "–"} v
+                  {mobileOps?.registry_schema_version ?? "–"}
+                </div>
+              </div>
+              {/* Migration */}
+              <div>
+                <div className="text-xs text-muted-foreground mb-1">Migration</div>
+                <div className="font-mono text-sm">
+                  {mobileOps?.migration_state ?? "–"}
+                </div>
+              </div>
+              {/* Latest timestamps */}
+              <div className="col-span-2">
+                <div className="text-xs text-muted-foreground mb-1">
+                  Latest activity
+                </div>
+                <div className="flex gap-4 text-xs">
+                  <div>
+                    <span className="text-muted-foreground">last mint:</span>{" "}
+                    {mobileOps?.latest_mint_ts
+                      ? new Date(mobileOps.latest_mint_ts).toLocaleTimeString()
+                      : "–"}
+                  </div>
+                  <div>
+                    <span className="text-muted-foreground">last ws accept:</span>{" "}
+                    {mobileOps?.latest_ws_accept_ts
+                      ? new Date(mobileOps.latest_ws_accept_ts).toLocaleTimeString()
+                      : "–"}
+                  </div>
+                  <div>
+                    <span className="text-muted-foreground">direct ws:</span>{" "}
+                    {mobileOps?.direct_ws_accepted ? "yes" : "no"}
+                  </div>
+                </div>
+              </div>
+              {/* Audit events */}
+              <div className="col-span-2">
+                <div className="text-xs text-muted-foreground mb-1">
+                  Audit events (24h)
+                </div>
+                <div className="grid grid-cols-3 gap-2 text-xs">
+                  <div>
+                    <span className="text-muted-foreground">mints</span>{" "}
+                    {mobileOps?.recent_mint_count ?? 0}
+                  </div>
+                  <div>
+                    <span className="text-muted-foreground">mint rejects</span>{" "}
+                    {mobileOps?.recent_mint_reject_count ?? 0}
+                  </div>
+                  <div>
+                    <span className="text-muted-foreground">pairings</span>{" "}
+                    {mobileOps?.recent_pairing_count ?? 0}
+                  </div>
+                  <div>
+                    <span className="text-muted-foreground">revocations</span>{" "}
+                    {mobileOps?.recent_revocation_count ?? 0}
+                  </div>
+                  <div>
+                    <span className="text-muted-foreground">rotations</span>{" "}
+                    {mobileOps?.recent_rotation_count ?? 0}
+                  </div>
+                  <div>
+                    <span className="text-muted-foreground">rate limited</span>{" "}
+                    {mobileOps?.recent_rate_limit_count ?? 0}
+                  </div>
+                </div>
+              </div>
+              <div className="col-span-2 border-t border-border pt-4">
+                <div className="flex items-center justify-between gap-3">
+                  <div>
+                    <div className="text-sm font-medium">Pair a mobile device</div>
+                    <div className="text-xs text-muted-foreground">
+                      Create a short-lived one-time code, then enter it in the iPhone app under Settings → Gateway.
+                    </div>
+                  </div>
+                  <Button
+                    size="sm"
+                    onClick={createMobilePairingCode}
+                    disabled={creatingMobilePairing}
+                    prefix={creatingMobilePairing ? <Spinner /> : <KeyRound className="h-3.5 w-3.5" />}
+                  >
+                    Generate pairing code
+                  </Button>
+                </div>
+                {mobilePairing && (
+                  <div className="mt-3 flex items-center justify-between gap-3 border border-border bg-background/50 p-3">
+                    <div>
+                      <div className="text-xs text-muted-foreground">One-time pairing code</div>
+                      <div className="font-mono text-2xl tracking-[0.25em]" aria-label="Mobile pairing code">
+                        {mobilePairing.code}
+                      </div>
+                      <div className="text-xs text-muted-foreground">
+                        Expires {new Date(mobilePairing.expires_at).toLocaleTimeString()}
+                      </div>
+                    </div>
+                    <Button
+                      size="sm"
+                      ghost
+                      prefix={<Copy className="h-3.5 w-3.5" />}
+                      onClick={async () => {
+                        if (await copyTextToClipboard(mobilePairing.code)) {
+                          showToast("Pairing code copied", "success");
+                        } else {
+                          showToast("Couldn't copy pairing code", "error");
+                        }
+                      }}
+                    >
+                      Copy
+                    </Button>
+                  </div>
+                )}
+                <div className="mt-4 flex flex-col gap-2">
+                  <div className="text-xs uppercase tracking-wider text-muted-foreground">
+                    Registered devices
+                  </div>
+                  {mobileDevices.length === 0 ? (
+                    <div className="text-sm text-muted-foreground">No registered mobile devices.</div>
+                  ) : (
+                    mobileDevices.map((device) => {
+                      const revoked = Boolean(device.revoked_at);
+                      return (
+                        <div
+                          key={device.device_id}
+                          className="flex items-center gap-3 border border-border bg-background/40 px-3 py-2"
+                        >
+                          <div className="min-w-0 flex-1">
+                            <div className="text-sm font-medium">{device.device_name}</div>
+                            <div className="text-xs text-muted-foreground">
+                              {device.last_used_at
+                                ? `Last used ${new Date(device.last_used_at).toLocaleString()}`
+                                : `Paired ${new Date(device.created_at).toLocaleString()}`}
+                            </div>
+                          </div>
+                          <Badge tone={revoked ? "secondary" : "success"}>
+                            {revoked ? "revoked" : "active"}
+                          </Badge>
+                          {!revoked && (
+                            <Button
+                              size="sm"
+                              ghost
+                              className="text-destructive"
+                              onClick={() => mobileDeviceRevoke.requestDelete(device.device_id)}
+                              prefix={<Trash2 className="h-3.5 w-3.5" />}
+                            >
+                              Revoke
+                            </Button>
+                          )}
+                        </div>
+                      );
+                    })
+                  )}
+                </div>
+              </div>
+            </div>
           </CardContent>
         </Card>
       </section>

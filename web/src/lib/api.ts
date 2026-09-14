@@ -1275,6 +1275,21 @@ export const api = {
   // ── Admin: Portal ───────────────────────────────────────────────────
   getPortal: () => fetchJSON<PortalStatus>("/api/portal"),
 
+  // ── Admin: Mobile ops status ────────────────────────────────────────
+  getMobileOpsStatus: () => fetchJSON<MobileOpsStatus>("/api/mobile/ops-status"),
+  createMobilePairingCode: (deviceName: string) =>
+    fetchJSON<MobilePairingCodeResponse>("/api/mobile/pairing-codes", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ device_name: deviceName }),
+    }),
+  getMobileDevices: () => fetchJSON<MobileDevice[]>("/api/mobile/devices"),
+  revokeMobileDevice: (deviceId: string) =>
+    fetchJSON<{ revoked: boolean }>(
+      `/api/mobile/devices/${encodeURIComponent(deviceId)}/revoke`,
+      { method: "POST" },
+    ),
+
   // ── Admin: Diagnostics (backgrounded) ───────────────────────────────
   runPromptSize: () =>
     fetchJSON<ActionResponse>("/api/ops/prompt-size", { method: "POST" }),
@@ -1824,6 +1839,53 @@ export interface PortalStatus {
   provider: string;
   subscription_url: string;
   features: PortalFeature[];
+}
+
+export interface MobileOpsStatus {
+  schema_version: number;
+  overall_health: string;
+  runtime_version: string | null;
+  runtime_commit: string | null;
+  registry_backend: string;
+  registry_schema_version: number;
+  integrity_ok: boolean;
+  integrity_check_ts: string | null;
+  migration_state: string;
+  active_device_count: number;
+  revoked_device_count: number;
+  recent_mint_count: number;
+  recent_mint_reject_count: number;
+  recent_expired_ticket_count: number;
+  recent_replayed_ticket_count: number;
+  recent_wrong_audience_count: number;
+  recent_revoked_device_reject_count: number;
+  recent_malformed_count: number;
+  recent_oversized_count: number;
+  recent_ws_accept_count: number;
+  recent_pairing_count: number;
+  recent_revocation_count: number;
+  recent_rotation_count: number;
+  recent_rotation_reject_count: number;
+  recent_rate_limit_count: number;
+  latest_mint_ts: string | null;
+  latest_ws_accept_ts: string | null;
+  direct_ws_accepted: boolean;
+}
+
+export interface MobilePairingCodeResponse {
+  code: string;
+  expires_at: string;
+  ttl_seconds: number;
+  device_name: string;
+}
+
+export interface MobileDevice {
+  device_id: string;
+  device_name: string;
+  created_at: string;
+  last_used_at: string | null;
+  revoked_at: string | null;
+  credential_version: number;
 }
 
 export interface CheckpointSession {

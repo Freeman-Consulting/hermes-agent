@@ -43,6 +43,9 @@ TTL_SECONDS = 30
 
 _lock = threading.Lock()
 _tickets: Dict[str, Tuple[int, Dict[str, Any]]] = {}  # ticket -> (expires_at, info)
+# Short-lived tombstones distinguish a genuine replay from an arbitrary
+# unknown ticket without retaining the ticket indefinitely.
+_consumed_tickets: Dict[str, int] = {}  # ticket -> tombstone expiry
 
 #: The process-lifetime internal credential (see module docstring). Lazily
 #: minted on first ``internal_ws_credential()`` call and stable for the life
@@ -58,13 +61,22 @@ INTERNAL_PROVIDER = "server-internal"
 class TicketInvalid(Exception):
     """Ticket missing, expired, or already consumed."""
 
+    def __init__(self, message: str, *, reason_code: str = "") -> None:
+        super().__init__(message)
+        self.reason_code = reason_code
 
-def mint_ticket(*, user_id: str, provider: str) -> str:
+
+def mint_ticket(*, user_id: str, provider: str, audience: Optional[str] = None) -> str:
     """Generate a one-shot ticket bound to this user identity.
 
     The returned token is base64url, 43 bytes of entropy (32-byte random
     seed). Stash returns the ``info`` dict to the caller on consume so the
     WS handler can carry the identity forward into its session log.
+
+    ``audience`` optionally narrows where the ticket can be consumed. Browser
+    session tickets omit it and remain valid for the dashboard WS family;
+    mobile-device tickets set ``audience="/api/ws"`` so a phone credential
+    cannot mint a ticket for PTY/console/event sockets.
     """
     ticket = secrets.token_urlsafe(32)
     info = {
@@ -72,18 +84,22 @@ def mint_ticket(*, user_id: str, provider: str) -> str:
         "provider": provider,
         "minted_at": int(time.time()),
     }
+    if audience:
+        info["audience"] = audience
     with _lock:
         _tickets[ticket] = (int(time.time()) + TTL_SECONDS, info)
         _gc_expired_locked()
     return ticket
 
 
-def consume_ticket(ticket: str) -> Dict[str, Any]:
+def consume_ticket(ticket: str, *, audience: Optional[str] = None) -> Dict[str, Any]:
     """Validate and consume. Raises :class:`TicketInvalid` on missing/expired/used.
 
     Single-use semantics: a successful consume immediately removes the
     ticket from the store, so a second call with the same value raises
-    ``TicketInvalid("unknown ticket: …")``.
+    ``TicketInvalid("unknown ticket: …")``. Audience mismatches also consume
+    the ticket; presenting a ticket to the wrong WS endpoint should not leave
+    it reusable.
     """
     now = int(time.time())
     with _lock:
@@ -92,10 +108,18 @@ def consume_ticket(ticket: str) -> Dict[str, Any]:
             # Truncate ticket value in the error so misuse never logs the
             # secret in full.
             truncated = (ticket[:8] + "…") if ticket else "<empty>"
-            raise TicketInvalid(f"unknown ticket: {truncated}")
+            reason_code = "replayed" if ticket in _consumed_tickets else "unknown"
+            raise TicketInvalid(
+                f"unknown ticket: {truncated}",
+                reason_code=reason_code,
+            )
         expires_at, info = entry
         if expires_at < now:
-            raise TicketInvalid("expired")
+            raise TicketInvalid("expired", reason_code="expired")
+        expected_audience = info.get("audience")
+        if audience and expected_audience and expected_audience != audience:
+            raise TicketInvalid("audience mismatch", reason_code="wrong_audience")
+        _consumed_tickets[ticket] = now + TTL_SECONDS
         return info
 
 
@@ -105,6 +129,9 @@ def _gc_expired_locked() -> None:
     expired = [t for t, (exp, _) in _tickets.items() if exp < now]
     for t in expired:
         _tickets.pop(t, None)
+    expired_tombstones = [t for t, exp in _consumed_tickets.items() if exp < now]
+    for t in expired_tombstones:
+        _consumed_tickets.pop(t, None)
 
 
 def internal_ws_credential() -> str:
@@ -153,9 +180,26 @@ def consume_internal_credential(value: str) -> Dict[str, Any]:
     }
 
 
+def purge_mobile_tickets(*, user_id: str) -> int:
+    """Remove outstanding in-process tickets for a specific mobile user_id.
+
+    Preserves browser/internal tickets: only tickets whose info user_id
+    matches the given value are purged. Returns the count of purged tickets.
+    """
+    with _lock:
+        to_remove = [
+            ticket for ticket, (_exp, info) in _tickets.items()
+            if info.get("user_id") == user_id
+        ]
+        for ticket in to_remove:
+            _tickets.pop(ticket, None)
+        return len(to_remove)
+
+
 def _reset_for_tests() -> None:
     """Test-only: drop all tickets and the internal credential."""
     global _internal_credential
     with _lock:
         _tickets.clear()
+        _consumed_tickets.clear()
         _internal_credential = None

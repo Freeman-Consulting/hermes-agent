@@ -41,6 +41,24 @@ class TestMintAndConsume:
         assert info["provider"] == "nous"
         assert "minted_at" in info
 
+    def test_audience_bound_ticket_round_trip(self):
+        ticket = mint_ticket(user_id="mobile:ios_1", provider="mobile-device", audience="/api/ws")
+        info = consume_ticket(ticket, audience="/api/ws")
+        assert info["user_id"] == "mobile:ios_1"
+        assert info["provider"] == "mobile-device"
+        assert info["audience"] == "/api/ws"
+
+    def test_audience_mismatch_rejects_and_consumes(self):
+        ticket = mint_ticket(user_id="mobile:ios_1", provider="mobile-device", audience="/api/ws")
+        with pytest.raises(TicketInvalid, match="audience mismatch"):
+            consume_ticket(ticket, audience="/api/pty")
+        with pytest.raises(TicketInvalid, match="unknown"):
+            consume_ticket(ticket, audience="/api/ws")
+
+    def test_unbound_browser_ticket_accepts_endpoint_audience(self):
+        ticket = mint_ticket(user_id="u1", provider="nous")
+        assert consume_ticket(ticket, audience="/api/pty")["user_id"] == "u1"
+
     def test_ticket_has_minimum_length(self):
         # ``secrets.token_urlsafe(32)`` produces ~43 chars; enforce a floor
         # so a future refactor can't accidentally shrink the entropy.
