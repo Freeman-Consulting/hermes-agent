@@ -17,7 +17,12 @@ CHATGPT_REJECTED_CODEX_PRO_SLUGS = {
 
 def test_curated_codex_fallback_excludes_chatgpt_rejected_pro_slugs(monkeypatch):
     """OAuth fallback retains real models but never synthesizes rejected ones."""
-    retained_models = {"gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"}
+    retained_models = {
+        "gpt-6-astra",
+        "gpt-5.6-sol",
+        "gpt-5.6-terra",
+        "gpt-5.6-luna",
+    }
     template_models = {model for model, _fallbacks in _FORWARD_COMPAT_TEMPLATE_MODELS}
 
     assert retained_models.issubset(DEFAULT_CODEX_MODELS)
@@ -33,6 +38,33 @@ def test_curated_codex_fallback_excludes_chatgpt_rejected_pro_slugs(monkeypatch)
 
     assert retained_models.issubset(model_ids)
     assert CHATGPT_REJECTED_CODEX_PRO_SLUGS.isdisjoint(model_ids)
+
+
+def test_curated_codex_fallback_inserts_astra_once_without_reordering_existing_models(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path))
+
+    model_ids = get_codex_model_ids()
+    existing_models = [
+        model for model in DEFAULT_CODEX_MODELS if model != "gpt-6-astra"
+    ]
+
+    assert model_ids.count("gpt-6-astra") == 1
+    assert model_ids.index("gpt-6-astra") < model_ids.index("gpt-5.6-sol")
+    assert [model for model in model_ids if model in existing_models] == existing_models
+    assert "gpt-6-astra-900k" not in model_ids
+
+
+def test_live_catalog_deduplicates_astra(monkeypatch):
+    monkeypatch.setattr(
+        "hermes_cli.codex_models._fetch_models_from_api",
+        lambda access_token: ["gpt-6-astra", "gpt-5.6-sol", "gpt-6-astra"],
+    )
+
+    model_ids = get_codex_model_ids(access_token="codex-access-token")
+
+    assert model_ids.count("gpt-6-astra") == 1
 
 
 def test_picker_synthesizes_900k_variants_for_verified_slugs():

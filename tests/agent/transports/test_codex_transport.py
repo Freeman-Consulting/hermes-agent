@@ -58,6 +58,30 @@ class TestCodexBuildKwargs:
         )
         assert kw["model"] == "gpt-5.6-sol"
 
+    @pytest.mark.parametrize(
+        ("model", "requested", "expected"),
+        [
+            ("gpt-6-astra", "medium", "medium"),
+            ("gpt-6-astra", "max", "max"),
+            ("gpt-5.6-sol", "max", "max"),
+            ("gpt-5.5", "max", "xhigh"),
+        ],
+    )
+    def test_codex_reasoning_effort_uses_verified_model_vocabulary(
+        self, transport, model, requested, expected
+    ):
+        """Exercise the real kwargs builder while pinning existing behavior."""
+        kw = transport.build_kwargs(
+            model=model,
+            messages=[{"role": "user", "content": "Hi"}],
+            tools=[],
+            is_codex_backend=True,
+            provider="openai-codex",
+            reasoning_config={"enabled": True, "effort": requested},
+        )
+
+        assert kw["reasoning"]["effort"] == expected
+
 
 
 

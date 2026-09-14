@@ -13,9 +13,10 @@ import os
 logger = logging.getLogger(__name__)
 
 DEFAULT_CODEX_MODELS: List[str] = [
-    # GPT-5.6 series (Sol/Terra/Luna). The public API exposes "-pro"
-    # variants, but the ChatGPT Codex OAuth backend rejects them with HTTP 400,
-    # so the curated offline fallback must not surface those dead choices.
+    # GPT-6 Astra and GPT-5.6 series (Sol/Terra/Luna). The public API exposes
+    # GPT-5.6 "-pro" variants, but the ChatGPT Codex OAuth backend rejects them
+    # with HTTP 400, so the curated fallback must not surface those dead choices.
+    "gpt-6-astra",
     "gpt-5.6-sol",
     "gpt-5.6-terra",
     "gpt-5.6-luna",
@@ -51,6 +52,7 @@ DEFAULT_CODEX_MODELS: List[str] = [
 ]
 
 _FORWARD_COMPAT_TEMPLATE_MODELS: List[tuple[str, tuple[str, ...]]] = [
+    ("gpt-6-astra", ("gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.5", "gpt-5.4")),
     ("gpt-5.6-sol", ("gpt-5.5", "gpt-5.4")),
     ("gpt-5.6-terra", ("gpt-5.5", "gpt-5.4")),
     ("gpt-5.6-luna", ("gpt-5.5", "gpt-5.4")),
@@ -66,11 +68,10 @@ _FORWARD_COMPAT_TEMPLATE_MODELS: List[tuple[str, tuple[str, ...]]] = [
 
 
 def _add_forward_compat_models(model_ids: List[str]) -> List[str]:
-    """Add Clawdbot-style synthetic forward-compat Codex models.
+    """Add synthetic forward-compatible Codex model IDs.
 
     If a newer Codex slug isn't returned by live discovery, surface it when an
-    older compatible template model is present. This mirrors Clawdbot's
-    synthetic catalog / forward-compat behavior for GPT-5 Codex variants.
+    older compatible template model is present.
     """
     ordered: List[str] = []
     seen: set[str] = set()
