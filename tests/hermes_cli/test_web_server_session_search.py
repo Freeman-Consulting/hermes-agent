@@ -101,6 +101,9 @@ class _FakeSessionDB:
     def get_compression_tip(self, session_id):
         return session_id
 
+    def list_sessions_rich(self, **kwargs):
+        return []
+
     def close(self):
         self.closed = True
 
@@ -138,6 +141,34 @@ def test_desktop_session_search_merges_id_matches_before_content_matches(monkeyp
                 "model": "gpt",
                 "session_started": 200,
             },
-        ]
+        ],
+        "has_more": False,
+        "next_offset": 2,
     }
     assert _FakeSessionDB.opened_read_only is True
+
+
+def test_desktop_session_search_paginates_deduplicated_results(monkeypatch):
+    class PagingDB(_FakeSessionDB):
+        def search_sessions_by_id(self, *args, **kwargs):
+            return []
+
+        def search_messages(self, *args, **kwargs):
+            return [
+                {
+                    "session_id": f"session-{index}",
+                    "snippet": f"hit {index}",
+                    "role": "user",
+                    "source": "cli",
+                    "model": "test",
+                    "session_started": index,
+                }
+                for index in range(3)
+            ]
+
+    monkeypatch.setattr("hermes_state.SessionDB", PagingDB)
+    response = asyncio.run(web_server.search_sessions(q="needle", limit=1, offset=1))
+
+    assert [row["session_id"] for row in response["results"]] == ["session-1"]
+    assert response["has_more"] is True
+    assert response["next_offset"] == 2

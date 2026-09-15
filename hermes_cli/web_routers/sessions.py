@@ -206,6 +206,7 @@ def get_sessions(
 async def search_sessions(
     q: str = "",
     limit: int = 20,
+    offset: int = 0,
     profile: Optional[str] = None,
     source: str = None,
     sources: str = None,
@@ -227,6 +228,8 @@ async def search_sessions(
         db = _open_session_db_for_profile(profile, read_only=True)
         try:
             safe_limit = max(1, min(int(limit or 20), 100))
+            safe_offset = max(0, min(int(offset or 0), 1000))
+            target_count = safe_offset + safe_limit + 1
             source_filter = source or None
             source_list = [s.strip() for s in (sources or "").split(",") if s.strip()]
             include_sources = [source_filter] if source_filter else (source_list or None)
@@ -313,7 +316,7 @@ async def search_sessions(
                 if not raw_sid:
                     return
                 root = compression_root(raw_sid)
-                if root in seen or len(seen) >= safe_limit:
+                if root in seen or len(seen) >= target_count:
                     return
                 payload = dict(payload)
                 sid = lineage_tip(root)
@@ -356,7 +359,7 @@ async def search_sessions(
             # SQL-bounded, so this stays cheap even with thousands of sessions.
             for row in db.search_sessions_by_id(
                 q,
-                limit=safe_limit,
+                limit=target_count,
                 include_archived=True,
                 source=source_filter,
                 sources=source_list or None,
@@ -389,7 +392,7 @@ async def search_sessions(
             prefix_query = " ".join(terms)
             # Over-fetch so lineage dedup can still surface `limit` distinct
             # conversations even when several hits collapse onto one root.
-            fetch_limit = max(safe_limit * 5, 50)
+            fetch_limit = min(max(target_count * 5, 50), 5500)
             matches = db.search_messages(
                 query=prefix_query,
                 source_filter=include_sources,
@@ -406,7 +409,7 @@ async def search_sessions(
             )
 
             for m in matches:
-                if len(seen) >= safe_limit:
+                if len(seen) >= target_count:
                     break
                 add_lineage_result(
                     m["session_id"],
@@ -422,20 +425,20 @@ async def search_sessions(
             # Fill remaining slots with title/preview matches across the whole
             # profile. This preserves metadata search without limiting clients
             # to whichever recent-session page they happened to load.
-            if len(seen) < safe_limit:
+            if len(seen) < target_count:
                 metadata_rows = db.list_sessions_rich(
                     source=source_filter,
                     sources=source_list or None,
                     exclude_sources=exclude_list or None,
                     search_query=q,
-                    limit=safe_limit,
+                    limit=target_count,
                     order_by_last_active=True,
                     compact_rows=True,
                     include_archived=True,
                     include_hidden=False,
                 )
                 for row in metadata_rows:
-                    if len(seen) >= safe_limit:
+                    if len(seen) >= target_count:
                         break
                     sid = row.get("id")
                     add_lineage_result(
@@ -448,7 +451,14 @@ async def search_sessions(
                             "session_started": row.get("started_at"),
                         },
                     )
-            return {"results": list(seen.values())}
+            all_results = list(seen.values())
+            page = all_results[safe_offset : safe_offset + safe_limit]
+            has_more = len(all_results) > safe_offset + len(page)
+            return {
+                "results": page,
+                "has_more": has_more,
+                "next_offset": safe_offset + len(page),
+            }
         finally:
             db.close()
     except HTTPException:
