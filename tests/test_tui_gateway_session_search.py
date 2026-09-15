@@ -40,3 +40,18 @@ def test_session_search_collapses_compression_lineage_to_live_tip(monkeypatch):
     assert results[0]["id"] == "tip"
     assert results[0]["lineage_root"] == "root"
     assert results[0]["match_count"] == 2
+
+
+def test_session_search_does_not_expose_database_errors(monkeypatch):
+    class BrokenDB:
+        def search_messages(self, *args, **kwargs):
+            raise RuntimeError("secret path /private/state.db")
+
+    monkeypatch.setattr(server, "_get_db", lambda: BrokenDB())
+    response = server.handle_request({
+        "id": "failure", "method": "session.search", "params": {"query": "needle"}
+    })
+
+    assert response is not None
+    assert response["error"]["message"] == "Search failed"
+    assert "private" not in str(response)

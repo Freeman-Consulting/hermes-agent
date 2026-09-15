@@ -470,8 +470,8 @@ def _(rid, params: dict) -> dict:
                     "next_offset": offset + len(raw_matches),
                 },
             )
-        except Exception as e:
-            return _err(rid, 5006, str(e))
+        except Exception:
+            return _err(rid, 5006, "Search failed")
 
 
 @method("session.most_recent")
