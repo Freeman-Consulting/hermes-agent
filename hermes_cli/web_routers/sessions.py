@@ -376,6 +376,7 @@ async def search_sessions(
                         "source": row.get("source"),
                         "model": row.get("model"),
                         "session_started": row.get("started_at"),
+                        "match_timestamp": row.get("last_active") or row.get("started_at"),
                     },
                 )
 
@@ -402,6 +403,7 @@ async def search_sessions(
                     "session_id",
                     "role",
                     "snippet",
+                    "timestamp",
                     "source",
                     "model",
                     "session_started",
@@ -419,6 +421,7 @@ async def search_sessions(
                         "source": m.get("source"),
                         "model": m.get("model"),
                         "session_started": m.get("session_started"),
+                        "match_timestamp": m.get("timestamp"),
                     },
                 )
 
@@ -449,6 +452,7 @@ async def search_sessions(
                             "source": row.get("source"),
                             "model": row.get("model"),
                             "session_started": row.get("started_at"),
+                            "match_timestamp": row.get("last_active") or row.get("started_at"),
                         },
                     )
             all_results = list(seen.values())

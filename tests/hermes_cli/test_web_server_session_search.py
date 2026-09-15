@@ -48,6 +48,7 @@ class _FakeSessionDB:
                 "source": "cli",
                 "model": "claude",
                 "started_at": 100,
+                "last_active": 101,
             }
         ]
         return [
@@ -84,6 +85,7 @@ class _FakeSessionDB:
                 "source": "desktop",
                 "model": "gpt",
                 "session_started": 200,
+                "timestamp": 201,
             },
         ]
         return [
@@ -117,6 +119,7 @@ def test_desktop_session_search_merges_id_matches_before_content_matches(monkeyp
 
     assert _FakeSessionDB.requested_fields is not None
     assert "context" not in _FakeSessionDB.requested_fields
+    assert "timestamp" in _FakeSessionDB.requested_fields
     # ID match surfaces first; the content hit on the SAME session is deduped
     # by lineage root (not double-listed); the unrelated content hit follows.
     assert response == {
@@ -130,6 +133,7 @@ def test_desktop_session_search_merges_id_matches_before_content_matches(monkeyp
                 "source": "cli",
                 "model": "claude",
                 "session_started": 100,
+                "match_timestamp": 101,
             },
             {
                 "id": "content_session",
@@ -140,6 +144,7 @@ def test_desktop_session_search_merges_id_matches_before_content_matches(monkeyp
                 "source": "desktop",
                 "model": "gpt",
                 "session_started": 200,
+                "match_timestamp": 201,
             },
         ],
         "has_more": False,
