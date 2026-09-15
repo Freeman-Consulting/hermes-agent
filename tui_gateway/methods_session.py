@@ -284,6 +284,134 @@ def _(rid, params: dict) -> dict:
             return _err(rid, 5006, str(e))
 
 
+@method("session.search")
+def _(rid, params: dict) -> dict:
+    """Search one profile's human-facing sessions and message bodies.
+
+    This is a read-only mobile/desktop contract. Results carry bounded excerpts,
+    never complete transcripts, and exclude hidden/archived/internal sessions.
+    """
+    raw_query = params.get("query")
+    if not isinstance(raw_query, str):
+        return _err(rid, 4006, "query must be a string")
+    query = raw_query.strip()
+    if len(query) < 2 or len(query) > 200:
+        return _err(rid, 4006, "query must contain 2 to 200 characters")
+
+    try:
+        limit = min(max(int(params.get("limit", 20) or 20), 1), 50)
+        offset = max(int(params.get("offset", 0) or 0), 0)
+    except (TypeError, ValueError):
+        return _err(rid, 4006, "limit and offset must be integers")
+
+    deny = frozenset({"kanban", "tool"})
+    scan_limit = min(limit * 4, 200)
+
+    def bounded_text(value, maximum=320):
+        return " ".join(str(value or "").split())[:maximum]
+
+    def eligible(row):
+        if not row or row.get("archived") or row.get("hidden"):
+            return False
+        return (row.get("source") or "").strip().lower() not in deny
+
+    def result_row(row, *, snippet, kind, role=None, timestamp=None, count=1):
+        return {
+            "id": row["id"],
+            "title": bounded_text(row.get("title"), 160),
+            "snippet": bounded_text(snippet),
+            "match_kind": kind,
+            "match_role": role,
+            "match_timestamp": timestamp,
+            "match_count": count,
+            "source": bounded_text(row.get("source"), 80),
+            "started_at": row.get("started_at") or 0,
+            "last_active": row.get("last_active") or row.get("last_activity_at") or 0,
+            "message_count": row.get("message_count") or 0,
+        }
+
+    with _profile_db(params) as db:
+        if db is None:
+            return _db_unavailable_error(rid, code=5006)
+        try:
+            raw_matches = db.search_messages(
+                query,
+                exclude_sources=["kanban", "tool"],
+                role_filter=["user", "assistant"],
+                limit=scan_limit,
+                offset=offset,
+                fields=("id", "session_id", "role", "snippet", "timestamp", "source"),
+            )
+
+            grouped = {}
+            for match in raw_matches:
+                session_id = str(match.get("session_id") or "").strip()
+                if not session_id:
+                    continue
+                bucket = grouped.setdefault(session_id, {"first": match, "count": 0})
+                bucket["count"] += 1
+
+            results = []
+            seen = set()
+            for session_id, bucket in grouped.items():
+                row = db.get_session(session_id)
+                if not eligible(row):
+                    continue
+                first = bucket["first"]
+                results.append(
+                    result_row(
+                        row,
+                        snippet=first.get("snippet"),
+                        kind="content",
+                        role=first.get("role"),
+                        timestamp=first.get("timestamp"),
+                        count=bucket["count"],
+                    )
+                )
+                seen.add(session_id)
+                if len(results) >= limit:
+                    break
+
+            # Metadata search is included only on the first page. Content hits
+            # keep relevance priority; title/id/preview hits fill remaining rows.
+            if offset == 0 and len(results) < limit:
+                metadata_rows = db.list_sessions_rich(
+                    source=None,
+                    exclude_sources=["kanban", "tool"],
+                    limit=limit,
+                    search_query=query,
+                    order_by_last_active=True,
+                    compact_rows=True,
+                    include_archived=False,
+                    include_hidden=False,
+                )
+                for row in metadata_rows:
+                    session_id = str(row.get("id") or "").strip()
+                    if not session_id or session_id in seen or not eligible(row):
+                        continue
+                    results.append(
+                        result_row(
+                            row,
+                            snippet=row.get("preview"),
+                            kind="metadata",
+                        )
+                    )
+                    seen.add(session_id)
+                    if len(results) >= limit:
+                        break
+
+            return _ok(
+                rid,
+                {
+                    "results": results,
+                    "has_more": len(raw_matches) == scan_limit,
+                    "next_offset": offset + len(raw_matches),
+                },
+            )
+        except Exception as e:
+            return _err(rid, 5006, str(e))
+
+
 @method("session.most_recent")
 def _(rid, params: dict) -> dict:
     """Return the most recent human-facing session id, or ``None``.

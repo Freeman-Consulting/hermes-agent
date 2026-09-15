@@ -14582,6 +14582,159 @@ def test_session_list_returns_clean_error_when_state_db_is_unavailable(monkeypat
     assert "state.db unavailable: locking protocol" in resp["error"]["message"]
 
 
+def test_session_search_rejects_invalid_query_without_touching_db(monkeypatch):
+    class NoSearchDB:
+        def search_messages(self, *args, **kwargs):
+            raise AssertionError("invalid query must fail before database access")
+
+    monkeypatch.setattr(server, "_get_db", lambda: NoSearchDB())
+
+    for query in ("", " ", "x", "x" * 201):
+        resp = server.handle_request(
+            {"id": "search-invalid", "method": "session.search", "params": {"query": query}}
+        )
+        assert resp is not None
+        assert resp["error"]["code"] == 4006
+
+
+def test_session_search_returns_deduplicated_content_and_metadata_hits(monkeypatch):
+    calls = {}
+
+    class SearchDB:
+        def search_messages(self, query, **kwargs):
+            calls["search"] = (query, kwargs)
+            return [
+                {"id": 1, "session_id": "body-hit", "role": "assistant", "snippet": "Found >>>bluewidget<<< here", "timestamp": 20, "source": "tui"},
+                {"id": 2, "session_id": "body-hit", "role": "user", "snippet": "Another bluewidget", "timestamp": 10, "source": "tui"},
+                {"id": 3, "session_id": "hidden-hit", "role": "assistant", "snippet": "hidden bluewidget", "timestamp": 30, "source": "tui"},
+            ]
+
+        def list_sessions_rich(self, **kwargs):
+            calls["metadata"] = kwargs
+            return [
+                {"id": "title-hit", "title": "Bluewidget planning", "preview": "Metadata preview", "source": "cli", "started_at": 5, "last_active": 6, "message_count": 2},
+                {"id": "body-hit", "title": "Body conversation", "preview": "Old preview", "source": "tui", "started_at": 1, "last_active": 20, "message_count": 4},
+            ]
+
+        def get_session(self, session_id):
+            rows = {
+                "body-hit": {"id": "body-hit", "title": "Body conversation", "preview": "Old preview", "source": "tui", "started_at": 1, "last_activity_at": 20, "message_count": 4, "archived": 0, "hidden": 0},
+                "hidden-hit": {"id": "hidden-hit", "title": "Internal", "preview": "", "source": "tui", "started_at": 2, "message_count": 1, "archived": 0, "hidden": 1},
+            }
+            return rows.get(session_id)
+
+    monkeypatch.setattr(server, "_get_db", lambda: SearchDB())
+    resp = server.handle_request(
+        {"id": "search-1", "method": "session.search", "params": {"query": "bluewidget", "limit": 20}}
+    )
+
+    assert resp is not None
+    assert "error" not in resp, resp
+    result = resp["result"]
+    assert [row["id"] for row in result["results"]] == ["body-hit", "title-hit"]
+    body = result["results"][0]
+    assert body["match_kind"] == "content"
+    assert body["snippet"] == "Found >>>bluewidget<<< here"
+    assert body["match_role"] == "assistant"
+    assert body["match_count"] == 2
+    assert calls["search"][0] == "bluewidget"
+    assert calls["search"][1]["role_filter"] == ["user", "assistant"]
+    assert calls["search"][1]["exclude_sources"] == ["kanban", "tool"]
+    assert calls["metadata"]["search_query"] == "bluewidget"
+
+
+def test_session_search_clamps_bounds_and_uses_raw_match_cursor(monkeypatch):
+    class SearchDB:
+        def search_messages(self, query, **kwargs):
+            assert kwargs["limit"] == 200
+            assert kwargs["offset"] == 7
+            return []
+
+        def list_sessions_rich(self, **kwargs):
+            raise AssertionError("metadata search only runs on the first page")
+
+    monkeypatch.setattr(server, "_get_db", lambda: SearchDB())
+    resp = server.handle_request(
+        {"id": "search-page", "method": "session.search", "params": {"query": "needle", "limit": 999, "offset": 7}}
+    )
+    assert resp is not None
+    assert resp["result"] == {"results": [], "has_more": False, "next_offset": 7}
+
+
+def test_session_search_real_db_finds_message_body(monkeypatch, tmp_path):
+    from hermes_state import SessionDB
+
+    db = SessionDB(db_path=tmp_path / "state.db")
+    try:
+        db.create_session("search-real", source="tui")
+        db.set_session_title("search-real", "Unrelated title")
+        db.append_message(
+            "search-real",
+            role="user",
+            content="The private transcript phrase is sapphire wombat.",
+        )
+        db.append_message("search-real", role="assistant", content="Recorded.")
+        monkeypatch.setattr(server, "_get_db", lambda: db)
+
+        resp = server.handle_request(
+            {
+                "id": "search-real-db",
+                "method": "session.search",
+                "params": {"query": "sapphire wombat", "limit": 20},
+            }
+        )
+        assert resp is not None
+        assert "error" not in resp, resp
+        assert [row["id"] for row in resp["result"]["results"]] == ["search-real"]
+        result = resp["result"]["results"][0]
+        assert result["match_kind"] == "content"
+        assert ">>>sapphire<<<" in result["snippet"]
+        assert ">>>wombat<<<" in result["snippet"]
+    finally:
+        db.close()
+
+
+def test_session_search_honors_profile_and_closes_dedicated_db(monkeypatch, tmp_path):
+    seen = {}
+    profile_home = tmp_path / "profiles" / "search-profile"
+    profile_home.mkdir(parents=True)
+
+    class ProfileDB:
+        def __init__(self, db_path):
+            seen["db_path"] = db_path
+
+        def search_messages(self, query, **kwargs):
+            seen["query"] = query
+            return []
+
+        def list_sessions_rich(self, **kwargs):
+            return []
+
+        def close(self):
+            seen["closed"] = True
+
+    monkeypatch.setattr(
+        server,
+        "_profile_home",
+        lambda profile: profile_home if profile == "search-profile" else None,
+    )
+    monkeypatch.setattr(server, "_get_db", lambda: (_ for _ in ()).throw(AssertionError("launch DB must not be used")))
+    monkeypatch.setattr("hermes_state.SessionDB", ProfileDB)
+
+    resp = server.handle_request(
+        {
+            "id": "search-profile",
+            "method": "session.search",
+            "params": {"profile": "search-profile", "query": "needle"},
+        }
+    )
+    assert resp is not None
+    assert "error" not in resp, resp
+    assert seen["query"] == "needle"
+    assert str(seen["db_path"]).endswith("state.db")
+    assert seen["closed"] is True
+
+
 # --------------------------------------------------------------------------
 # session.delete — TUI resume picker `d` key
 # --------------------------------------------------------------------------
