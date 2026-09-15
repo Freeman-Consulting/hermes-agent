@@ -418,6 +418,36 @@ async def search_sessions(
                         "session_started": m.get("session_started"),
                     },
                 )
+
+            # Fill remaining slots with title/preview matches across the whole
+            # profile. This preserves metadata search without limiting clients
+            # to whichever recent-session page they happened to load.
+            if len(seen) < safe_limit:
+                metadata_rows = db.list_sessions_rich(
+                    source=source_filter,
+                    sources=source_list or None,
+                    exclude_sources=exclude_list or None,
+                    search_query=q,
+                    limit=safe_limit,
+                    order_by_last_active=True,
+                    compact_rows=True,
+                    include_archived=True,
+                    include_hidden=False,
+                )
+                for row in metadata_rows:
+                    if len(seen) >= safe_limit:
+                        break
+                    sid = row.get("id")
+                    add_lineage_result(
+                        sid,
+                        {
+                            "snippet": (row.get("preview") or "").strip(),
+                            "role": None,
+                            "source": row.get("source"),
+                            "model": row.get("model"),
+                            "session_started": row.get("started_at"),
+                        },
+                    )
             return {"results": list(seen.values())}
         finally:
             db.close()

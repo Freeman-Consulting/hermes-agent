@@ -315,9 +315,60 @@ def _(rid, params: dict) -> dict:
             return False
         return (row.get("source") or "").strip().lower() not in deny
 
-    def result_row(row, *, snippet, kind, role=None, timestamp=None, count=1):
+    def session_record(session_id):
+        try:
+            row = db.get_session_rich_row(session_id)
+        except (AttributeError, NotImplementedError):
+            row = db.get_session(session_id)
+        return row
+
+    root_cache = {}
+
+    def compression_root(session_id):
+        if session_id in root_cache:
+            return root_cache[session_id]
+        chain = []
+        current = session_id
+        visited = set()
+        root = session_id
+        while current and current not in visited:
+            visited.add(current)
+            chain.append(current)
+            row = db.get_session(current)
+            if not row:
+                root = current
+                break
+            parent_id = row.get("parent_session_id")
+            if not parent_id:
+                root = current
+                break
+            parent = db.get_session(parent_id)
+            is_compression = (
+                parent
+                and parent.get("end_reason") == "compression"
+                and parent.get("ended_at") is not None
+                and row.get("started_at") is not None
+                and row["started_at"] >= parent["ended_at"]
+            )
+            if not is_compression:
+                root = current
+                break
+            current = parent_id
+        for node in chain:
+            root_cache[node] = root
+        return root
+
+    def lineage_tip(root_id):
+        try:
+            return db.get_compression_tip(root_id) or root_id
+        except (AttributeError, NotImplementedError):
+            return root_id
+
+    def result_row(row, *, snippet, kind, role=None, timestamp=None, count=1, root=None):
         return {
             "id": row["id"],
+            "session_id": row["id"],
+            "lineage_root": root or row["id"],
             "title": bounded_text(row.get("title"), 160),
             "snippet": bounded_text(snippet),
             "match_kind": kind,
@@ -345,16 +396,18 @@ def _(rid, params: dict) -> dict:
 
             grouped = {}
             for match in raw_matches:
-                session_id = str(match.get("session_id") or "").strip()
-                if not session_id:
+                raw_session_id = str(match.get("session_id") or "").strip()
+                if not raw_session_id:
                     continue
-                bucket = grouped.setdefault(session_id, {"first": match, "count": 0})
+                root_id = compression_root(raw_session_id)
+                bucket = grouped.setdefault(root_id, {"first": match, "count": 0})
                 bucket["count"] += 1
 
             results = []
             seen = set()
-            for session_id, bucket in grouped.items():
-                row = db.get_session(session_id)
+            for root_id, bucket in grouped.items():
+                tip_id = lineage_tip(root_id)
+                row = session_record(tip_id)
                 if not eligible(row):
                     continue
                 first = bucket["first"]
@@ -366,9 +419,10 @@ def _(rid, params: dict) -> dict:
                         role=first.get("role"),
                         timestamp=first.get("timestamp"),
                         count=bucket["count"],
+                        root=root_id,
                     )
                 )
-                seen.add(session_id)
+                seen.add(root_id)
                 if len(results) >= limit:
                     break
 
@@ -385,18 +439,26 @@ def _(rid, params: dict) -> dict:
                     include_archived=False,
                     include_hidden=False,
                 )
-                for row in metadata_rows:
-                    session_id = str(row.get("id") or "").strip()
-                    if not session_id or session_id in seen or not eligible(row):
+                for matched_row in metadata_rows:
+                    raw_session_id = str(matched_row.get("id") or "").strip()
+                    if not raw_session_id:
+                        continue
+                    root_id = compression_root(raw_session_id)
+                    if root_id in seen:
+                        continue
+                    tip_id = lineage_tip(root_id)
+                    row = session_record(tip_id) or matched_row
+                    if not eligible(row):
                         continue
                     results.append(
                         result_row(
                             row,
-                            snippet=row.get("preview"),
+                            snippet=matched_row.get("preview"),
                             kind="metadata",
+                            root=root_id,
                         )
                     )
-                    seen.add(session_id)
+                    seen.add(root_id)
                     if len(results) >= limit:
                         break
 
