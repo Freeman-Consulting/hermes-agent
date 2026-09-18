@@ -1943,8 +1943,11 @@ def run_conversation(
             Display-only: transcript surfaces render the row as a timeline
             event instead of a user bubble, while the model still receives
             the message unchanged.
-        persist_user_display_metadata: Optional payload for that event
-            (e.g. a delegation's task count).
+        persist_user_display_metadata: Optional display-only payload persisted
+            on either a synthetic event or a normal user turn (for example, a
+            delegation count or a safe attachment projection). It does not
+            require ``persist_user_display_kind`` and is stripped from model API
+            messages.
         persist_user_platform_id: Optional platform-side message id (e.g. the
             Discord/Telegram message id) to store as metadata on that
             persisted user message, so restart drain-window recovery can

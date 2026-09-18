@@ -798,16 +798,16 @@ def build_turn_context(
     # stamped by an earlier close flush.
     #
     # A synthesized turn (auto-continue recovery note, delegation completion)
-    # declares how it should READ in a transcript. Stamp that on the live
-    # message so the crash persist below writes the row already typed. Typing
-    # it after the turn instead leaves the row untyped for the whole run — and
-    # forever if the turn crashes — so the raw system note paints as a user
-    # bubble. The model still receives role/content unchanged; the api_messages
-    # build strips both fields from every outgoing copy.
+    # declares how it should READ in a transcript. A normal user turn can also
+    # carry display metadata (for example, a safe attachment projection) without
+    # becoming a synthetic timeline event. Stamp both at turn start so the
+    # crash persist below writes the authoritative presentation in the same row.
+    # The model still receives role/content unchanged; the api_messages build
+    # strips both fields from every outgoing copy.
     if persist_user_display_kind:
         user_msg["display_kind"] = persist_user_display_kind
-        if persist_user_display_metadata:
-            user_msg["display_metadata"] = persist_user_display_metadata
+    if persist_user_display_metadata:
+        user_msg["display_metadata"] = persist_user_display_metadata
 
     # Stamp the platform-side message id (e.g. the Discord/Telegram message id)
     # as metadata on the user turn so it survives the early crash-resilience

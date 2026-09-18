@@ -104,3 +104,28 @@ def test_a_real_user_turn_stays_untyped(agent_db):
 
     row, = [r for r in db.get_messages_as_conversation(sid) if r["role"] == "user"]
     assert row.get("display_kind") is None
+
+
+def test_display_metadata_persists_without_a_display_kind(agent_db):
+    agent, db, sid = agent_db
+    metadata = {
+        "display_text": "safe attachment prompt",
+        "attachments": [
+            {
+                "schema": "hermes.attachment",
+                "version": 1,
+                "id": "att_0123456789abcdef0123456789abcdef",
+            }
+        ],
+    }
+
+    _build(
+        agent,
+        user_message="safe attachment prompt\n\n@file:attachments/private.txt",
+        persist_user_display_metadata=metadata,
+    )
+
+    row, = [r for r in db.get_messages_as_conversation(sid) if r["role"] == "user"]
+    assert row.get("display_kind") is None
+    assert row["display_metadata"] == metadata
+    assert "@file:" in row["content"]

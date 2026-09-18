@@ -3545,6 +3545,36 @@ def _sess_building(params, rid):
     return (s, None)
 
 
+def _sess_attachment_mutation(params, rid):
+    """Resolve and claim a session before any attachment-side mutation.
+
+    Attachment staging writes session queues and, for byte uploads, the
+    filesystem before prompt.submit runs. It therefore needs the exact same
+    active-session admission decision as prompt delivery. The claim happens
+    before the deferred agent build is started so a session owned by another
+    live client is left completely untouched.
+    """
+
+    sid = params.get("session_id") or ""
+    session, err = _sess_nowait(params, rid)
+    if err:
+        return (None, err)
+    assert session is not None
+    if (limit_message := _ensure_active_session_slot(sid, session)) is not None:
+        reason = getattr(limit_message, "reason", None)
+        return (
+            None,
+            _err(
+                rid,
+                4090,
+                str(limit_message),
+                {"reason": reason} if reason else None,
+            ),
+        )
+    _start_agent_build(sid, session)
+    return (session, None)
+
+
 def _normalize_completion_path(path_part: str) -> str:
     expanded = os.path.expanduser(path_part)
     if os.name != "nt":
@@ -9635,6 +9665,49 @@ def _legacy_display_kind(role: str, text: str) -> str | None:
     return None
 
 
+def _canonical_attachment_descriptors(value: Any) -> list[dict]:
+    """Validate descriptors before they reach any client-visible surface."""
+
+    if not isinstance(value, list):
+        return []
+    from hermes_cli.mobile_artifacts import validate_attachment_descriptor
+
+    descriptors: list[dict] = []
+    for raw_descriptor in value:
+        try:
+            descriptors.append(validate_attachment_descriptor(raw_descriptor))
+        except (TypeError, ValueError):
+            # Fail closed: a malformed descriptor might carry a raw path or a
+            # model-only reference and therefore must not reach display APIs.
+            continue
+    return descriptors
+
+
+def _history_attachment_projection(
+    role: str, display_metadata: Any
+) -> tuple[str | None, list[dict], dict] | None:
+    """Build a path-free attachment projection for transcript surfaces."""
+
+    if not isinstance(display_metadata, dict) or "attachments" not in display_metadata:
+        return None
+    raw_attachments = display_metadata.get("attachments")
+    if not isinstance(raw_attachments, list):
+        return None
+    attachments = _canonical_attachment_descriptors(raw_attachments)
+    raw_display_text = display_metadata.get("display_text")
+    display_text = raw_display_text if isinstance(raw_display_text, str) else None
+    if role == "user" and display_text is None:
+        # The persisted model-facing content may contain @file or image paths.
+        # If attachment metadata exists but has no explicit safe projection,
+        # hide that content rather than leak it through history/resume.
+        display_text = ""
+
+    safe_metadata: dict[str, Any] = {"attachments": attachments}
+    if display_text is not None:
+        safe_metadata["display_text"] = display_text
+    return display_text, attachments, safe_metadata
+
+
 def _history_to_messages(history: list[dict]) -> list[dict]:
     messages = []
     tool_call_args = {}
@@ -9701,7 +9774,13 @@ def _history_to_messages(history: list[dict]) -> list[dict]:
         has_reasoning = role == "assistant" and any(
             m.get(key) for key in reasoning_keys
         )
-        if not content_text.strip() and not has_reasoning:
+        display_metadata = m.get("display_metadata")
+        attachment_projection = _history_attachment_projection(role, display_metadata)
+        if (
+            not content_text.strip()
+            and not has_reasoning
+            and attachment_projection is None
+        ):
             continue
         msg = {"role": role, "text": content_text}
         # Persisted authoring time (Unix seconds) for display.timestamps
@@ -9734,8 +9813,19 @@ def _history_to_messages(history: list[dict]) -> list[dict]:
         display_kind = m.get("display_kind") or _legacy_display_kind(role, content_text)
         if display_kind:
             msg["display_kind"] = display_kind
-        if m.get("display_metadata"):
-            msg["display_metadata"] = m["display_metadata"]
+        if attachment_projection is not None:
+            display_text, attachments, safe_metadata = attachment_projection
+            if display_text is not None:
+                msg["text"] = display_text
+            if attachments:
+                msg["attachments"] = attachments
+            msg["display_metadata"] = safe_metadata
+        elif display_metadata and not (
+            role == "user"
+            and isinstance(display_metadata, dict)
+            and "attachments" in display_metadata
+        ):
+            msg["display_metadata"] = display_metadata
         messages.append(msg)
 
     return messages
@@ -10448,6 +10538,18 @@ def _inflight_snapshot(session: dict) -> dict | None:
         "streaming": streaming,
         "user": user,
     }
+    raw_attachments = turn.get("attachments")
+    if isinstance(raw_attachments, list) and raw_attachments:
+        from hermes_cli.mobile_artifacts import validate_attachment_descriptor
+
+        attachments = []
+        for descriptor in raw_attachments:
+            try:
+                attachments.append(validate_attachment_descriptor(descriptor))
+            except (TypeError, ValueError):
+                continue
+        if attachments:
+            snapshot["attachments"] = attachments
     raw_corrections = turn.get("corrections") or []
     raw_offsets = turn.get("correction_offsets") or []
     correction_pairs = [
@@ -13146,6 +13248,10 @@ def _run_prompt_submit(
                 run_kwargs["task_id"] = session["session_key"]
             if display_kind and "persist_user_display_kind" in _run_params:
                 run_kwargs["persist_user_display_kind"] = display_kind
+            if (
+                display_metadata is not None
+                and "persist_user_display_metadata" in _run_params
+            ):
                 run_kwargs["persist_user_display_metadata"] = display_metadata
             # Auto-titling now fires inside the turn prologue (shared by every
             # surface). Hand the agent this session's live-rename hook so the
@@ -13347,6 +13453,11 @@ def _run_prompt_submit(
                 status = "complete"
 
             payload = {"text": raw, "usage": _get_usage(agent), "status": status}
+            result_attachments = _canonical_attachment_descriptors(
+                result.get("attachments") if isinstance(result, dict) else None
+            )
+            if result_attachments:
+                payload["attachments"] = result_attachments
             if last_reasoning:
                 payload["reasoning"] = last_reasoning
             if status_note:
@@ -13836,10 +13947,19 @@ def _run_prompt_submit(
 
 
 # Byte-upload attach caps. 25 MB matches Anthropic's per-image limit; 50 MB / 25
-# pages bounds a single PDF drop so it can't blow the context budget.
+# pages bounds a single PDF drop so it can't blow the context budget. General
+# files use the Hermes Mobile v1 raw-byte ceiling: unlike images/PDFs, the old
+# file.attach path had no server-side bound before base64 decode/read/write.
 _ATTACH_BYTES_MAX_BYTES = 25 * 1024 * 1024
 _PDF_ATTACH_MAX_BYTES = 50 * 1024 * 1024
 _PDF_ATTACH_MAX_PAGES = 25
+_FILE_ATTACH_MAX_BYTES = 10 * 1024 * 1024
+_ATTACH_DATA_URL_HEADER_MAX_CHARS = 512
+_ATTACH_DATA_URL_MAX_WHITESPACE_CHARS = 64 * 1024
+
+
+class _AttachmentTooLarge(ValueError):
+    """A staged attachment exceeded its authoritative server byte cap."""
 
 # Leading magic bytes → file extension, for filename-less uploads.
 _IMAGE_MAGIC: tuple[tuple[bytes, str], ...] = (
@@ -14049,14 +14169,59 @@ def _decode_attachment_data_url(data_url: str) -> bytes:
     import re as _re
 
     cleaned = (data_url or "").strip()
-    m = _re.match(r"^data:[^;,]*(?:;[^;,=]+=[^;,]+)*;base64,(.*)$", cleaned, _re.DOTALL | _re.I)
-    if m:
-        cleaned = m.group(1)
+    encoded_cap = 4 * ((_FILE_ATTACH_MAX_BYTES + 2) // 3)
+    transport_cap = (
+        encoded_cap
+        + _ATTACH_DATA_URL_HEADER_MAX_CHARS
+        + _ATTACH_DATA_URL_MAX_WHITESPACE_CHARS
+    )
+    if len(cleaned) > transport_cap:
+        raise _AttachmentTooLarge(
+            f"file too large; cap is {_FILE_ATTACH_MAX_BYTES // (1024 * 1024)} MB"
+        )
+
+    if cleaned.lower().startswith("data:"):
+        header, separator, payload = cleaned.partition(",")
+        if (
+            not separator
+            or len(header) > _ATTACH_DATA_URL_HEADER_MAX_CHARS
+            or _re.fullmatch(
+                r"data:[^;,]*(?:;[^;,=]+=[^;,]+)*;base64",
+                header,
+                _re.I,
+            )
+            is None
+        ):
+            raise ValueError("invalid data_url payload")
+        cleaned = payload
+
     cleaned = _re.sub(r"\s+", "", cleaned)
+    if len(cleaned) > encoded_cap:
+        raise _AttachmentTooLarge(
+            f"file too large; cap is {_FILE_ATTACH_MAX_BYTES // (1024 * 1024)} MB"
+        )
     try:
-        return _base64.b64decode(cleaned, validate=True)
+        payload = _base64.b64decode(cleaned, validate=True)
     except (ValueError, _binascii.Error) as exc:
         raise ValueError("invalid data_url payload") from exc
+    if len(payload) > _FILE_ATTACH_MAX_BYTES:
+        raise _AttachmentTooLarge(
+            f"file too large ({len(payload)} bytes; "
+            f"cap is {_FILE_ATTACH_MAX_BYTES // (1024 * 1024)} MB)"
+        )
+    return payload
+
+
+def _read_bounded_attachment_file(path: Path) -> bytes:
+    """Read at most the file.attach cap plus one sentinel byte."""
+
+    with path.open("rb") as handle:
+        payload = handle.read(_FILE_ATTACH_MAX_BYTES + 1)
+    if len(payload) > _FILE_ATTACH_MAX_BYTES:
+        raise _AttachmentTooLarge(
+            f"file too large; cap is {_FILE_ATTACH_MAX_BYTES // (1024 * 1024)} MB"
+        )
+    return payload
 
 
 def _stage_session_file_attachment(
@@ -14065,7 +14230,8 @@ def _stage_session_file_attachment(
     raw_path: str,
     data_url: str,
     name: str,
-) -> tuple[Path, bool]:
+    return_payload: bool = False,
+) -> tuple[Path, bool, bytes | None]:
     """Make a desktop file attachment available to the remote gateway agent.
 
     Three cases:
@@ -14078,16 +14244,29 @@ def _stage_session_file_attachment(
          path on the CLIENT's disk) — decode the uploaded ``data_url`` bytes and
          write them into the session home's ``attachments/`` dir.
 
-    Returns ``(stored_path, uploaded)``.
+    Returns ``(stored_path, uploaded, payload)``. ``payload`` is populated only
+    when explicitly requested so legacy local-path attaches do not add an
+    unnecessary read; the v1 upload path reuses the already bounded bytes rather
+    than reopening the staged file.
     """
     workspace = Path(_session_cwd(session)).resolve()
     resolved = _resolve_gateway_attachment_path(raw_path)
     if resolved is not None:
         try:
+            file_size = resolved.stat().st_size
+        except OSError as exc:
+            raise ValueError("gateway attachment could not be inspected") from exc
+        if file_size > _FILE_ATTACH_MAX_BYTES:
+            raise _AttachmentTooLarge(
+                f"file too large ({file_size} bytes; "
+                f"cap is {_FILE_ATTACH_MAX_BYTES // (1024 * 1024)} MB)"
+            )
+        try:
             resolved.relative_to(workspace)
-            return resolved, False
+            payload = _read_bounded_attachment_file(resolved) if return_payload else None
+            return resolved, False, payload
         except ValueError:
-            payload = resolved.read_bytes()
+            payload = _read_bounded_attachment_file(resolved)
             filename = resolved.name
     else:
         if not data_url:
@@ -14098,7 +14277,125 @@ def _stage_session_file_attachment(
     upload_dir = _desktop_attachment_dir(session)
     target = _unique_attachment_path(upload_dir, _sanitize_attachment_name(filename))
     target.write_bytes(payload)
-    return target.resolve(), True
+    return target.resolve(), True, payload if return_payload else None
+
+
+_MOBILE_STAGED_ATTACHMENT_TTL_SECONDS = 15 * 60
+
+
+def _mobile_attachment_lock(session: dict) -> threading.Lock:
+    # dict.setdefault is atomic under the CPython runtime used by the Gateway;
+    # concurrent first-stage calls may allocate an extra lock object but both
+    # receive the single object stored in the session.
+    return session.setdefault("_mobile_attachment_lock", threading.Lock())
+
+
+def _discard_staged_mobile_attachment(session: dict, record: dict) -> None:
+    image_paths = set(record.get("image_paths") or [])
+    if image_paths:
+        session["attached_images"] = [
+            path
+            for path in session.get("attached_images", [])
+            if path not in image_paths
+        ]
+
+
+def _prune_staged_mobile_attachments(session: dict, *, now: float) -> None:
+    pending = session.setdefault("_staged_mobile_attachments", {})
+    expired_ids = [
+        attachment_id
+        for attachment_id, record in pending.items()
+        if now - float(record.get("staged_at") or 0) > _MOBILE_STAGED_ATTACHMENT_TTL_SECONDS
+    ]
+    for attachment_id in expired_ids:
+        record = pending.pop(attachment_id, None)
+        if isinstance(record, dict):
+            _discard_staged_mobile_attachment(session, record)
+
+
+def _stage_mobile_attachment(
+    session: dict,
+    *,
+    descriptor: dict,
+    ref_text: str = "",
+    image_paths: list[str] | None = None,
+) -> dict:
+    """Bind a path-free v1 descriptor to server-private prompt inputs."""
+
+    from hermes_cli.mobile_artifacts import validate_attachment_descriptor
+
+    canonical = validate_attachment_descriptor(descriptor)
+    if canonical["direction"] != "inbound":
+        raise ValueError("only inbound attachments can be staged for a prompt")
+    record = {
+        "descriptor": canonical,
+        "ref_text": str(ref_text or ""),
+        "image_paths": list(image_paths or []),
+        "staged_at": time.time(),
+    }
+    with _mobile_attachment_lock(session):
+        _prune_staged_mobile_attachments(session, now=record["staged_at"])
+        session.setdefault("_staged_mobile_attachments", {})[canonical["id"]] = record
+        # V1 inputs are consumed only by explicit attachment_ids. Keep their
+        # private image paths out of the legacy next-prompt queue so an omitted
+        # ID cannot silently attach or later duplicate them.
+        _discard_staged_mobile_attachment(session, record)
+    return canonical
+
+
+def _peek_staged_mobile_attachments(
+    session: dict, attachment_ids: list[str]
+) -> list[dict] | None:
+    with _mobile_attachment_lock(session):
+        _prune_staged_mobile_attachments(session, now=time.time())
+        pending = session.setdefault("_staged_mobile_attachments", {})
+        records = [pending.get(attachment_id) for attachment_id in attachment_ids]
+        if not all(isinstance(record, dict) for record in records):
+            return None
+        return [dict(record) for record in records]
+
+
+def _consume_staged_mobile_attachments(
+    session: dict, attachment_ids: list[str]
+) -> list[dict] | None:
+    with _mobile_attachment_lock(session):
+        _prune_staged_mobile_attachments(session, now=time.time())
+        pending = session.setdefault("_staged_mobile_attachments", {})
+        if any(not isinstance(pending.get(attachment_id), dict) for attachment_id in attachment_ids):
+            return None
+        records = [pending.pop(attachment_id) for attachment_id in attachment_ids]
+        for record in records:
+            _discard_staged_mobile_attachment(session, record)
+        return records
+
+
+def _restore_staged_mobile_attachments(session: dict, records: list[dict]) -> None:
+    if not records:
+        return
+    now = time.time()
+    with _mobile_attachment_lock(session):
+        pending = session.setdefault("_staged_mobile_attachments", {})
+        for record in records:
+            descriptor = record.get("descriptor")
+            if not isinstance(descriptor, dict) or not descriptor.get("id"):
+                continue
+            restored = dict(record)
+            restored["staged_at"] = now
+            pending[descriptor["id"]] = restored
+
+
+def _peek_staged_mobile_attachment(session: dict, attachment_id: str) -> dict | None:
+    records = _peek_staged_mobile_attachments(session, [attachment_id])
+    return records[0] if records else None
+
+
+def _consume_staged_mobile_attachment(session: dict, attachment_id: str) -> dict | None:
+    records = _consume_staged_mobile_attachments(session, [attachment_id])
+    return records[0] if records else None
+
+
+def _restore_staged_mobile_attachment(session: dict, record: dict) -> None:
+    _restore_staged_mobile_attachments(session, [record])
 
 
 # ── Methods: respond ─────────────────────────────────────────────────

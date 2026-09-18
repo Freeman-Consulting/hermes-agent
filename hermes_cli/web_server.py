@@ -3551,6 +3551,153 @@ async def mobile_ws_ticket(request: Request, body: MobileWsTicketRequest):
     return {"ticket": ticket, "ttl_seconds": TTL_SECONDS}
 
 
+class MobileArtifactDownloadRequest(BaseModel):
+    model_config = {"extra": "forbid"}
+
+    device_id: str
+    device_secret: str
+    artifact_id: str
+    profile: str = "default"
+    session_id: str
+
+    @field_validator("device_id", "artifact_id", "profile", "session_id")
+    @classmethod
+    def _bounded_identifier(cls, value: str, info) -> str:
+        cleaned = str(value or "").strip()
+        limits = {"device_id": 64, "artifact_id": 32, "profile": 64, "session_id": 256}
+        if not cleaned:
+            raise ValueError(f"{info.field_name} is required")
+        if len(cleaned) > limits[info.field_name]:
+            raise ValueError(f"{info.field_name} is too long")
+        return cleaned
+
+    @field_validator("device_secret")
+    @classmethod
+    def _bounded_secret(cls, value: str) -> str:
+        cleaned = str(value or "").strip()
+        if not cleaned:
+            raise ValueError("device_secret is required")
+        if len(cleaned) > 256:
+            raise ValueError("device_secret is too long")
+        return cleaned
+
+
+@app.post("/api/mobile/artifacts/download")
+async def download_mobile_artifact(request: Request, body: MobileArtifactDownloadRequest):
+    """Return one scoped artifact by opaque id after paired-device auth.
+
+    The request accepts no filesystem path. The artifact store independently
+    verifies the exact profile/session scope, bounded size, and checksum before
+    bytes are returned.
+    """
+
+    from urllib.parse import quote
+
+    from hermes_cli.dashboard_auth.audit import AuditEvent, audit_log, ticket_fingerprint
+    from hermes_cli.dashboard_auth.mobile_devices import (
+        DeviceAuthInvalid,
+        DeviceStoreError,
+        verify_device,
+    )
+    from hermes_cli.dashboard_auth.mobile_rate_limit import check_ticket_mint
+    from hermes_cli.mobile_artifacts import (
+        MobileArtifactCorrupt,
+        MobileArtifactExpired,
+        MobileArtifactNotFound,
+        MobileArtifactScopeMismatch,
+        load_mobile_artifact,
+    )
+
+    client_host = request.client.host if request.client else ""
+    allowed, retry_after = check_ticket_mint(client_host, body.device_id)
+    if not allowed:
+        audit_log(
+            AuditEvent.MOBILE_RATE_LIMIT_REJECTED,
+            operation="artifact_download",
+            reason="rate_limit",
+            device_id=body.device_id,
+            ip=client_host,
+        )
+        response = JSONResponse(
+            content={"detail": "Too many artifact requests. Try again later."},
+            status_code=429,
+        )
+        response.headers["Retry-After"] = str(retry_after)
+        return response
+
+    artifact_fp = ticket_fingerprint(body.artifact_id)
+    try:
+        verify_device(device_id=body.device_id, device_secret=body.device_secret)
+    except DeviceAuthInvalid:
+        audit_log(
+            AuditEvent.MOBILE_ARTIFACT_DOWNLOAD_REJECTED,
+            reason="invalid_device_credential",
+            device_id=body.device_id,
+            artifact_fp=artifact_fp,
+            ip=client_host,
+        )
+        raise HTTPException(status_code=401, detail="Invalid device credential")
+    except DeviceStoreError:
+        raise HTTPException(status_code=503, detail="Device store unavailable")
+
+    try:
+        artifact = load_mobile_artifact(
+            artifact_id=body.artifact_id,
+            profile=body.profile,
+            session_id=body.session_id,
+        )
+    except (MobileArtifactNotFound, MobileArtifactScopeMismatch):
+        audit_log(
+            AuditEvent.MOBILE_ARTIFACT_DOWNLOAD_REJECTED,
+            reason="not_found_or_scope_mismatch",
+            device_id=body.device_id,
+            artifact_fp=artifact_fp,
+            ip=client_host,
+        )
+        raise HTTPException(status_code=404, detail="Artifact not found")
+    except MobileArtifactExpired:
+        audit_log(
+            AuditEvent.MOBILE_ARTIFACT_DOWNLOAD_REJECTED,
+            reason="expired",
+            device_id=body.device_id,
+            artifact_fp=artifact_fp,
+            ip=client_host,
+        )
+        raise HTTPException(status_code=410, detail="Artifact expired")
+    except MobileArtifactCorrupt:
+        audit_log(
+            AuditEvent.MOBILE_ARTIFACT_DOWNLOAD_REJECTED,
+            reason="integrity_failure",
+            device_id=body.device_id,
+            artifact_fp=artifact_fp,
+            ip=client_host,
+        )
+        raise HTTPException(status_code=500, detail="Artifact unavailable")
+
+    descriptor = artifact.descriptor
+    audit_log(
+        AuditEvent.MOBILE_ARTIFACT_DOWNLOADED,
+        device_id=body.device_id,
+        artifact_fp=artifact_fp,
+        size_bytes=descriptor["size_bytes"],
+        ip=client_host,
+    )
+    response = Response(
+        content=artifact.data,
+        media_type=descriptor["mime_type"],
+        headers={
+            "Cache-Control": "no-store",
+            "Pragma": "no-cache",
+            "X-Content-Type-Options": "nosniff",
+            "Content-Disposition": (
+                "attachment; filename*=UTF-8''" + quote(descriptor["name"], safe="")
+            ),
+            "X-Hermes-Attachment-Schema": "hermes.attachment/1",
+        },
+    )
+    return response
+
+
 # ---------------------------------------------------------------------------
 # Mobile device lifecycle controls (Phase 2)
 # ---------------------------------------------------------------------------

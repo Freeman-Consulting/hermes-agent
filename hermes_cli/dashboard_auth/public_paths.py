@@ -65,4 +65,8 @@ PUBLIC_API_PATHS: frozenset[str] = frozenset({
     "/api/mobile/pair",
     "/api/mobile/ws-ticket",
     "/api/mobile/credential/rotate",
+    # Fixed-path artifact download. This route carries its own paired-device
+    # credential check and accepts only an opaque artifact id plus exact
+    # profile/session scope; it never accepts a filesystem path.
+    "/api/mobile/artifacts/download",
 })

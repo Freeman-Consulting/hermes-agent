@@ -81,6 +81,8 @@ class AuditEvent(enum.Enum):
     MOBILE_REVOKED_DEVICE_REJECTED = "mobile_revoked_device_rejected"
     MOBILE_REQUEST_MALFORMED = "mobile_request_malformed"
     MOBILE_REQUEST_OVERSIZED = "mobile_request_oversized"
+    MOBILE_ARTIFACT_DOWNLOADED = "mobile_artifact_downloaded"
+    MOBILE_ARTIFACT_DOWNLOAD_REJECTED = "mobile_artifact_download_rejected"
 
 
 def _resolve_log_path() -> Path:

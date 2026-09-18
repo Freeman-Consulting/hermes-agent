@@ -442,6 +442,45 @@ def _(rid, params: dict) -> dict:
             str(limit_message),
             {"reason": reason} if reason else None,
         )
+
+    contract_version = params.get("attachment_contract_version")
+    raw_attachment_ids = params.get("attachment_ids")
+    if contract_version is not None and (
+        isinstance(contract_version, bool)
+        or not isinstance(contract_version, int)
+        or contract_version != 1
+    ):
+        return _err(rid, 4015, "unsupported attachment_contract_version")
+    if raw_attachment_ids is None:
+        attachment_ids: list[str] = []
+    elif contract_version != 1:
+        return _err(rid, 4015, "attachment_ids requires attachment_contract_version=1")
+    elif (
+        not isinstance(raw_attachment_ids, list)
+        or len(raw_attachment_ids) != 1
+        or any(
+            not isinstance(attachment_id, str)
+            or not 1 <= len(attachment_id) <= 128
+            for attachment_id in raw_attachment_ids
+        )
+        or len(set(raw_attachment_ids)) != len(raw_attachment_ids)
+    ):
+        return _err(rid, 4015, "attachment_ids must contain exactly one opaque id")
+    else:
+        attachment_ids = list(raw_attachment_ids)
+
+    if attachment_ids and not isinstance(text, str):
+        return _err(rid, 4015, "attachment prompt text must be a string")
+    if attachment_ids and _peek_staged_mobile_attachments(session, attachment_ids) is None:
+        return _err(rid, 4092, "one or more staged attachments are missing or expired")
+    accepted_attachment_records: list[dict] = []
+
+    def restore_accepted_attachments() -> None:
+        if accepted_attachment_records:
+            records = list(accepted_attachment_records)
+            accepted_attachment_records.clear()
+            _restore_staged_mobile_attachments(session, records)
+
     # Which desktop window this message was typed into. Rewritten on every
     # submit, because one session can be driven from the app window and the HUD
     # in turn: a stale "hud" would tell the model the user is still floating
@@ -452,6 +491,8 @@ def _(rid, params: dict) -> dict:
         or params.get("truncate_before_row_id") is not None
         or params.get("truncate_before_message_id") is not None
     )
+    if attachment_ids and has_truncation:
+        return _err(rid, 4015, "attachment prompts cannot also truncate history")
     if has_truncation and isinstance(text, str):
         # A rewind/regenerate replays a turn from what the transcript shows. A
         # skill turn shows its invocation, so re-expand it here — otherwise
@@ -462,6 +503,8 @@ def _(rid, params: dict) -> dict:
         )
     isolation_cfg = _load_dashboard_process_isolation_config()
     turn_isolation = _session_uses_compute_host(session, isolation_cfg)
+    if attachment_ids and turn_isolation:
+        return _err(rid, 4015, "attachment contract v1 does not support isolated compute workers")
     if internal_hosted_submit and turn_isolation:
         return _err(
             rid,
@@ -477,6 +520,12 @@ def _(rid, params: dict) -> dict:
         busy_transport = None
         with session["history_lock"]:
             if session.get("running"):
+                if attachment_ids:
+                    return _err(
+                        rid,
+                        4091,
+                        "attachment prompt is not queued while another turn is running",
+                    )
                 if internal_hosted_submit:
                     return _err(rid, 4091, "hosted room member session is busy")
                 # Don't reject a mid-turn prompt — queue it (and, by default,
@@ -519,6 +568,11 @@ def _(rid, params: dict) -> dict:
         # the upgrade resumes the child's transcript as a normal conversation.
         if session.get("lazy") and _child_run_active(str(session.get("session_key") or "")):
             return _err(rid, 4009, "subagent still running — wait for it to finish")
+        if attachment_ids:
+            staged_records = _consume_staged_mobile_attachments(session, attachment_ids)
+            if staged_records is None:
+                return _err(rid, 4092, "one or more staged attachments are missing or expired")
+            accepted_attachment_records = staged_records
         truncate_message_id = params.get("truncate_before_message_id")
         truncate_row_id = params.get("truncate_before_row_id")
         if (
@@ -928,6 +982,10 @@ def _(rid, params: dict) -> dict:
         if internal_hosted_submit:
             session["_hosted_room_task"] = dict(hosted_task)
         _start_inflight_turn(session, text)
+        if accepted_attachment_records:
+            session["inflight_turn"]["attachments"] = [
+                record["descriptor"] for record in accepted_attachment_records
+            ]
 
     if turn_isolation:
         isolated_response = _submit_prompt_to_compute_host(
@@ -958,6 +1016,11 @@ def _(rid, params: dict) -> dict:
             # Store unavailable: failing the RPC is the only user-visible
             # signal — same principle as the disk-full path above (#98924).
             # _db_error carries the SessionDB open failure for the toast.
+            with session["history_lock"]:
+                session["running"] = False
+                session["last_active"] = time.time()
+                _clear_inflight_turn(session)
+            restore_accepted_attachments()
             return _err(
                 rid,
                 5072,
@@ -975,6 +1038,7 @@ def _(rid, params: dict) -> dict:
             session["running"] = False
             session["last_active"] = time.time()
             _clear_inflight_turn(session)
+        restore_accepted_attachments()
         if is_disk_full_error(exc):
             return _err(
                 rid,
@@ -988,6 +1052,30 @@ def _(rid, params: dict) -> dict:
             f"session storage could not be written: {exc}",
         )
     _start_agent_build(sid, session)
+
+    attachment_descriptors = [
+        record["descriptor"] for record in accepted_attachment_records
+    ]
+    attachment_image_paths = [
+        image_path
+        for record in accepted_attachment_records
+        for image_path in record.get("image_paths") or []
+    ]
+    attachment_ref_texts = [
+        str(record.get("ref_text") or "")
+        for record in accepted_attachment_records
+        if str(record.get("ref_text") or "").strip()
+    ]
+    model_text = text
+    if attachment_ref_texts:
+        model_text = "\n\n".join(
+            part for part in [text, "\n".join(attachment_ref_texts)] if part
+        )
+    attachment_display_metadata = (
+        {"display_text": text, "attachments": attachment_descriptors}
+        if attachment_descriptors
+        else None
+    )
 
     def run_after_agent_ready() -> None:
         # Patient wait (#63078): the user's message is already the accepted
@@ -1011,6 +1099,7 @@ def _(rid, params: dict) -> dict:
             with session["history_lock"]:
                 session["running"] = False
                 session["last_active"] = time.time()
+            restore_accepted_attachments()
             _emit("session.info", sid, _session_info(session.get("agent"), session))
             return
         with session["history_lock"]:
@@ -1032,15 +1121,20 @@ def _(rid, params: dict) -> dict:
                         else "Session no longer running before the agent was ready"
                     },
                 )
+                restore_accepted_attachments()
                 return
-        _run_prompt_submit(
+        started = _run_prompt_submit(
             rid,
             sid,
             session,
-            text,
+            model_text,
             display_kind=display_kind,
+            display_metadata=attachment_display_metadata,
+            image_paths=attachment_image_paths if attachment_descriptors else None,
             terminal_callback=hosted_terminal_callback,
         )
+        if not started:
+            restore_accepted_attachments()
 
     run_thread = threading.Thread(target=run_after_agent_ready, daemon=True)
     # Keep a handle so session.interrupt can tell a live turn from a stuck
@@ -1051,6 +1145,11 @@ def _(rid, params: dict) -> dict:
         rid,
         {
             "status": "streaming",
+            **(
+                {"attachments": attachment_descriptors}
+                if attachment_descriptors
+                else {}
+            ),
             **(
                 {"survivor_user_row_ids": survivor_user_row_ids}
                 if survivor_user_row_ids is not None
@@ -1165,14 +1264,25 @@ def _(rid, params: dict) -> dict:
         an accepted alias for older desktop builds.
       filename / ext (str, optional): extension hint. Without it, magic bytes
         identify PNG/JPEG/GIF/WebP/BMP, falling back to ``.png``.
+      attachment_contract_version (int, optional): set to 1 for the path-free
+        mobile descriptor and server-bound prompt association contract.
     """
-    session, err = _sess_building(params, rid)
-    if err:
-        return err
+    contract_version = params.get("attachment_contract_version")
+    if contract_version is not None and (
+        isinstance(contract_version, bool)
+        or not isinstance(contract_version, int)
+        or contract_version != 1
+    ):
+        return _err(rid, 4015, "unsupported attachment_contract_version")
+    use_v1_contract = contract_version == 1
 
     raw_b64 = str(params.get("content_base64") or params.get("data") or "").strip()
     if not raw_b64:
         return _err(rid, 4015, "content_base64 required")
+
+    session, err = _sess_attachment_mutation(params, rid)
+    if err:
+        return err
 
     img_bytes = _decode_attach_base64(raw_b64, mime_prefix="image/")
     if img_bytes is None:
@@ -1194,7 +1304,43 @@ def _(rid, params: dict) -> dict:
     try:
         img_path = _queue_attached_image(session, img_bytes, ext, prefix="upload")
     except Exception as e:
+        if use_v1_contract:
+            return _err(rid, 5027, "image staging failed")
         return _err(rid, 5027, f"write failed: {e}")
+
+    image_meta = _image_meta(img_path)
+    if use_v1_contract:
+        import mimetypes
+
+        from hermes_cli.mobile_artifacts import build_inbound_attachment_descriptor
+
+        descriptor_metadata = {}
+        if image_meta.get("width") and image_meta.get("height"):
+            descriptor_metadata = {
+                "width_px": int(image_meta["width"]),
+                "height_px": int(image_meta["height"]),
+            }
+        descriptor = build_inbound_attachment_descriptor(
+            kind="image",
+            name=_sanitize_attachment_name(filename or img_path.name),
+            mime_type=mimetypes.guess_type(f"x{ext}")[0] or "application/octet-stream",
+            data=img_bytes,
+            metadata=descriptor_metadata,
+        )
+        descriptor = _stage_mobile_attachment(
+            session,
+            descriptor=descriptor,
+            image_paths=[str(img_path)],
+        )
+        return _ok(
+            rid,
+            {
+                "attached": True,
+                "count": 1,
+                "bytes": len(img_bytes),
+                "attachment": descriptor,
+            },
+        )
 
     return _ok(
         rid,
@@ -1205,7 +1351,7 @@ def _(rid, params: dict) -> dict:
             "remainder": "",
             "text": f"[User attached image: {img_path.name}]",
             "bytes": len(img_bytes),
-            **_image_meta(img_path),
+            **image_meta,
         },
     )
 
@@ -1220,26 +1366,39 @@ def _(rid, params: dict) -> dict:
     base64 ``content_base64`` (remote upload). Caps at 50 MB / 25 pages per call.
 
     Requires ``pdftoppm`` on $PATH (``apt install poppler-utils``); returns 5028
-    if missing.
+    if missing. ``attachment_contract_version=1`` requires uploaded bytes and
+    returns only a path-free descriptor plus staging metadata.
     """
     import shutil
     import subprocess
     import tempfile
 
-    session, err = _sess_building(params, rid)
-    if err:
-        return err
+    contract_version = params.get("attachment_contract_version")
+    if contract_version is not None and (
+        isinstance(contract_version, bool)
+        or not isinstance(contract_version, int)
+        or contract_version != 1
+    ):
+        return _err(rid, 4015, "unsupported attachment_contract_version")
+    use_v1_contract = contract_version == 1
 
     if shutil.which("pdftoppm") is None:
         return _err(rid, 5028, "pdftoppm not installed (poppler-utils package required)")
 
     raw_path = str(params.get("path", "") or "").strip()
     raw_b64 = str(params.get("content_base64") or params.get("data") or "").strip()
+    if use_v1_contract and raw_path:
+        return _err(rid, 4016, "path is not allowed for attachment contract v1")
     if not raw_path and not raw_b64:
         return _err(rid, 4015, "path or content_base64 required")
 
+    session, err = _sess_attachment_mutation(params, rid)
+    if err:
+        return err
+
     with tempfile.TemporaryDirectory(prefix="pdf_attach_") as td:
         td_path = Path(td)
+        pdf_bytes = b""
         if raw_b64:
             pdf_bytes = _decode_attach_base64(raw_b64, mime_prefix="application/pdf")
             if pdf_bytes is None:
@@ -1306,6 +1465,8 @@ def _(rid, params: dict) -> dict:
         except subprocess.TimeoutExpired:
             return _err(rid, 5028, "pdftoppm timed out (>120s)")
         if res.returncode != 0:
+            if use_v1_contract:
+                return _err(rid, 5028, "PDF conversion failed")
             tail = (res.stderr or res.stdout or "").strip().splitlines()[-3:]
             return _err(rid, 5028, "pdftoppm failed: " + " | ".join(tail))
 
@@ -1320,8 +1481,43 @@ def _(rid, params: dict) -> dict:
                 page_int = int(page_num)
             except ValueError:
                 page_int = first_page + len(attached_pages)
-            dst = _queue_attached_image(session, src.read_bytes(), ".png", prefix=f"pdf_p{page_num}")
+            try:
+                dst = _queue_attached_image(
+                    session,
+                    src.read_bytes(),
+                    ".png",
+                    prefix=f"pdf_p{page_num}",
+                )
+            except Exception:
+                if use_v1_contract:
+                    return _err(rid, 5028, "PDF page staging failed")
+                raise
             attached_pages.append({"path": str(dst), "page": page_int, **_image_meta(dst)})
+
+        if use_v1_contract:
+            from hermes_cli.mobile_artifacts import build_inbound_attachment_descriptor
+
+            descriptor = build_inbound_attachment_descriptor(
+                kind="pdf",
+                name=_sanitize_attachment_name(display_name),
+                mime_type="application/pdf",
+                data=pdf_bytes,
+                metadata={"page_count": len(attached_pages)},
+            )
+            descriptor = _stage_mobile_attachment(
+                session,
+                descriptor=descriptor,
+                image_paths=[page["path"] for page in attached_pages],
+            )
+            return _ok(
+                rid,
+                {
+                    "attached": True,
+                    "pages_attached": len(attached_pages),
+                    "count": len(attached_pages),
+                    "attachment": descriptor,
+                },
+            )
 
         return _ok(
             rid,
@@ -1354,20 +1550,74 @@ def _(rid, params: dict) -> dict:
       data_url (str): ``data:<mime>;base64,<b64>`` upload of the file bytes,
         required when the path isn't visible to the gateway.
       name (str, optional): preferred filename.
+      attachment_contract_version (int, optional): set to 1 for the path-free
+        mobile contract; v1 rejects ``path`` and requires ``data_url``.
     """
-    session, err = _sess_building(params, rid)
-    if err:
-        return err
+    contract_version = params.get("attachment_contract_version")
+    if contract_version is not None and (
+        isinstance(contract_version, bool)
+        or not isinstance(contract_version, int)
+        or contract_version != 1
+    ):
+        return _err(rid, 4015, "unsupported attachment_contract_version")
+    use_v1_contract = contract_version == 1
+
     raw = str(params.get("path", "") or "").strip()
     data_url = str(params.get("data_url", "") or "").strip()
     name = str(params.get("name", "") or "").strip()
+    if use_v1_contract and raw:
+        return _err(rid, 4016, "path is not allowed for attachment contract v1")
     if not raw and not data_url:
         return _err(rid, 4015, "path or data_url required")
+
+    session, err = _sess_attachment_mutation(params, rid)
+    if err:
+        return err
     try:
-        stored_path, uploaded = _stage_session_file_attachment(
-            session, raw_path=raw, data_url=data_url, name=name
+        stored_path, uploaded, staged_payload = _stage_session_file_attachment(
+            session,
+            raw_path=raw,
+            data_url=data_url,
+            name=name,
+            return_payload=use_v1_contract,
         )
         ref_path = _attachment_ref_path(session, stored_path)
+        ref_text = f"@file:{_format_ref_value(ref_path)}"
+        if use_v1_contract:
+            import mimetypes
+
+            from hermes_cli.mobile_artifacts import build_inbound_attachment_descriptor
+
+            header_mime = ""
+            if data_url.lower().startswith("data:") and "," in data_url:
+                header_mime = data_url[5:].split(",", 1)[0].split(";", 1)[0].strip()
+            mime_type = (
+                header_mime
+                or mimetypes.guess_type(stored_path.name)[0]
+                or "application/octet-stream"
+            )
+            if staged_payload is None:
+                raise RuntimeError("attachment staging did not retain bounded payload")
+            descriptor = build_inbound_attachment_descriptor(
+                kind="file",
+                name=stored_path.name,
+                mime_type=mime_type,
+                data=staged_payload,
+            )
+            descriptor = _stage_mobile_attachment(
+                session,
+                descriptor=descriptor,
+                ref_text=ref_text,
+            )
+            return _ok(
+                rid,
+                {
+                    "attached": True,
+                    "uploaded": uploaded,
+                    "attachment": descriptor,
+                },
+            )
+
         return _ok(
             rid,
             {
@@ -1375,11 +1625,15 @@ def _(rid, params: dict) -> dict:
                 "name": stored_path.name,
                 "path": str(stored_path),
                 "ref_path": ref_path,
-                "ref_text": f"@file:{_format_ref_value(ref_path)}",
+                "ref_text": ref_text,
                 "uploaded": uploaded,
             },
         )
+    except _AttachmentTooLarge as e:
+        return _err(rid, 4018, str(e))
     except Exception as e:
+        if use_v1_contract:
+            return _err(rid, 5028, "file staging failed")
         return _err(rid, 5028, str(e))
 
 

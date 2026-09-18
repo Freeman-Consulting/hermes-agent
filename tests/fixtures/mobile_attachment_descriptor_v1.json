@@ -1,0 +1,38 @@
+{
+  "schema": "hermes.mobile.attachment-fixtures",
+  "version": 1,
+  "inbound": {
+    "schema": "hermes.attachment",
+    "version": 1,
+    "id": "11111111111111111111111111111111",
+    "direction": "inbound",
+    "kind": "image",
+    "name": "photo.jpg",
+    "mime_type": "image/jpeg",
+    "size_bytes": 1234,
+    "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "metadata": {
+      "width_px": 640,
+      "height_px": 480
+    }
+  },
+  "outbound": {
+    "schema": "hermes.attachment",
+    "version": 1,
+    "id": "22222222222222222222222222222222",
+    "direction": "outbound",
+    "kind": "pdf",
+    "name": "result.pdf",
+    "mime_type": "application/pdf",
+    "size_bytes": 4321,
+    "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "metadata": {
+      "page_count": 2
+    },
+    "download": {
+      "transport": "paired_device_http",
+      "method": "POST",
+      "path": "/api/mobile/artifacts/download"
+    }
+  }
+}
