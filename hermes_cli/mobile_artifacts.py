@@ -16,6 +16,7 @@ import mimetypes
 import os
 import re
 import secrets
+import stat
 import tempfile
 import threading
 import time
@@ -522,6 +523,72 @@ def publish_mobile_artifact(
         session_id=session_id,
         filename=filename,
         mime_type=mime_type,
+        kind=kind,
+        metadata=metadata,
+    )
+
+
+def publish_mobile_artifact_path(
+    *,
+    path: str | os.PathLike[str],
+    profile: str,
+    session_id: str,
+    mime_type: str = "",
+    kind: str | None = None,
+    metadata: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Publish one regular file through the bounded, opaque mobile store.
+
+    The source path is an internal producer detail and is never copied into the
+    descriptor. A pre-read ``fstat`` rejects oversized/special files and the
+    single bounded read catches growth or replacement races before publication.
+    Symlinks are refused even when they resolve to an otherwise allowed file.
+    """
+
+    source = Path(path).expanduser()
+    try:
+        if source.is_symlink():
+            raise MobileArtifactCorrupt("artifact source is invalid")
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise MobileArtifactCorrupt("artifact source is invalid") from exc
+
+    flags = os.O_RDONLY
+    flags |= getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    fd = -1
+    try:
+        fd = os.open(os.fspath(source), flags)
+        source_stat = os.fstat(fd)
+        if not stat.S_ISREG(source_stat.st_mode):
+            raise MobileArtifactCorrupt("artifact source is not a regular file")
+        if source_stat.st_size <= 0:
+            raise MobileArtifactCorrupt("artifact is empty")
+        if source_stat.st_size > MOBILE_ARTIFACT_MAX_BYTES:
+            raise MobileArtifactTooLarge("artifact exceeds server byte cap")
+        with os.fdopen(fd, "rb", closefd=True) as handle:
+            fd = -1
+            payload = handle.read(MOBILE_ARTIFACT_MAX_BYTES + 1)
+    except MobileArtifactError:
+        raise
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise MobileArtifactCorrupt("artifact source is invalid") from exc
+    finally:
+        if fd >= 0:
+            os.close(fd)
+
+    if len(payload) > MOBILE_ARTIFACT_MAX_BYTES:
+        raise MobileArtifactTooLarge("artifact exceeds server byte cap")
+    if len(payload) != source_stat.st_size:
+        raise MobileArtifactCorrupt("artifact changed while being read")
+
+    safe_name = _safe_filename(source.name)
+    normalized_mime = _normalized_mime_type(mime_type, filename=safe_name)
+    return publish_mobile_artifact(
+        data=payload,
+        profile=profile,
+        session_id=session_id,
+        filename=safe_name,
+        mime_type=normalized_mime,
         kind=kind,
         metadata=metadata,
     )

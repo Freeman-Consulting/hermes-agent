@@ -691,6 +691,7 @@ async def get_session_messages(
     offset: int = Query(0, ge=0),
     order: Optional[str] = Query(None),
     include_compacted: bool = Query(False),
+    source: Optional[str] = Query(None),
 ):
     if order not in (None, "oldest", "latest"):
         raise HTTPException(
@@ -731,21 +732,29 @@ async def get_session_messages(
     from agent.context_compressor import is_compaction_summary_message
 
     projected_messages = []
+    mobile_projector = None
+    if source == "ios-pocket":
+        from tui_gateway.mobile_artifact_results import (
+            project_mobile_history_message as mobile_projector,
+        )
+
     for message in messages:
         if not is_compaction_summary_message(message):
-            projected_messages.append(message)
-            continue
-        display_view = project_compaction_message_for_display(message)
-        projected = message.copy()
-        if display_view is None:
-            if not projected.get("display_kind"):
-                projected["display_kind"] = "hidden"
+            projected = message
         else:
-            # Keep the physical content for inspection/export compatibility;
-            # Desktop consumes this display-only projection. A legacy hidden
-            # wrapper must not hide a successfully recovered live ask.
-            projected["display_content"] = display_view.get("content")
-            projected.pop("display_kind", None)
+            display_view = project_compaction_message_for_display(message)
+            projected = message.copy()
+            if display_view is None:
+                if not projected.get("display_kind"):
+                    projected["display_kind"] = "hidden"
+            else:
+                # Keep the physical content for inspection/export compatibility;
+                # Desktop consumes this display-only projection. A legacy hidden
+                # wrapper must not hide a successfully recovered live ask.
+                projected["display_content"] = display_view.get("content")
+                projected.pop("display_kind", None)
+        if mobile_projector is not None:
+            projected = mobile_projector(projected)
         projected_messages.append(projected)
     return {
         "session_id": sid,

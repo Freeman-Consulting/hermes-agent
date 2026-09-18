@@ -12055,6 +12055,43 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
         return bool(self._execute_write(_do))
 
+    def merge_latest_message_display_metadata(
+        self,
+        session_id: str,
+        *,
+        role: str,
+        display_metadata: Dict[str, Any],
+    ) -> bool:
+        """Merge display-only fields into the latest active row for ``role``.
+
+        Gateway result projection calls this immediately after its serialized
+        turn flush. Selecting the latest role row avoids matching transformed
+        response text while preserving reactions and other existing metadata.
+        Model-facing role/content fields are never changed.
+        """
+
+        if not session_id or not role or not isinstance(display_metadata, dict):
+            return False
+
+        def _do(conn):
+            row = conn.execute(
+                "SELECT id, display_metadata FROM messages "
+                "WHERE session_id = ? AND role = ? AND active = 1 "
+                "ORDER BY id DESC LIMIT 1",
+                (session_id, role),
+            ).fetchone()
+            if row is None:
+                return False
+            merged = self._decode_display_metadata(row[1]) or {}
+            merged.update(display_metadata)
+            conn.execute(
+                "UPDATE messages SET display_metadata = ? WHERE id = ?",
+                (self._encode_display_metadata(merged), row[0]),
+            )
+            return True
+
+        return bool(self._execute_write(_do))
+
     #: Key under which message reactions live inside ``display_metadata``.
     #: Reactions share the existing per-message JSON column rather than a side
     #: table so they survive rewind/compaction row rewrites with the row itself.

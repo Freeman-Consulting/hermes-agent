@@ -1713,7 +1713,13 @@ def _cache_dir_container_mounts() -> List[Tuple[Path, Path]]:
         return []
 
 
-def _warn_unresolved_docker_media(candidate: Path, session_key: str, reason: str) -> None:
+def _warn_unresolved_docker_media(
+    candidate: Path,
+    session_key: str,
+    reason: str,
+    *,
+    enabled: bool = True,
+) -> None:
     """Name WHY a container-absolute MEDIA path failed translation (#93950).
 
     Under Docker these failures used to surface only as the generic
@@ -1721,7 +1727,7 @@ def _warn_unresolved_docker_media(candidate: Path, session_key: str, reason: str
     file seemingly vanished. Point at the sandbox/session mismatch instead.
     Gated to Docker mode so host-path rejections stay quiet.
     """
-    if os.getenv("TERMINAL_ENV", "").strip().lower() != "docker":
+    if not enabled or os.getenv("TERMINAL_ENV", "").strip().lower() != "docker":
         return
     logger.warning(
         "Docker MEDIA path %s did not resolve to a host sandbox file (%s%s); "
@@ -1733,7 +1739,12 @@ def _warn_unresolved_docker_media(candidate: Path, session_key: str, reason: str
     )
 
 
-def _translate_docker_container_media_path(candidate: Path, session_key: str = "") -> Optional[Path]:
+def _translate_docker_container_media_path(
+    candidate: Path,
+    session_key: str = "",
+    *,
+    log_rejections: bool = True,
+) -> Optional[Path]:
     """Translate a container-absolute path to its host path when possible.
 
     Uses longest-prefix match across configured ``docker_volumes``, the
@@ -1778,7 +1789,12 @@ def _translate_docker_container_media_path(candidate: Path, session_key: str = "
                 mounts.append((home_root, Path("/root")))
 
     if not mounts:
-        _warn_unresolved_docker_media(candidate, session_key, "no sandbox mounts resolved")
+        _warn_unresolved_docker_media(
+            candidate,
+            session_key,
+            "no sandbox mounts resolved",
+            enabled=log_rejections,
+        )
         return None
     # Longest container-prefix match; equal-length prefixes (the candidate
     # sandbox layouts above) are tried in insertion order until one actually
@@ -1790,7 +1806,12 @@ def _translate_docker_container_media_path(candidate: Path, session_key: str = "
         if candidate_posix == container_posix or candidate_posix.startswith(container_posix + "/"):
             matched.append((host_root, container_root, len(container_posix)))
     if not matched:
-        _warn_unresolved_docker_media(candidate, session_key, "no mounted prefix matches")
+        _warn_unresolved_docker_media(
+            candidate,
+            session_key,
+            "no mounted prefix matches",
+            enabled=log_rejections,
+        )
         return None
     matched.sort(key=lambda m: -m[2])
     for host_root, container_root, _score in matched:
@@ -1802,11 +1823,21 @@ def _translate_docker_container_media_path(candidate: Path, session_key: str = "
         if translated != host_root and not _path_is_within(translated, host_root):
             continue
         return translated
-    _warn_unresolved_docker_media(candidate, session_key, "host file missing from sandbox")
+    _warn_unresolved_docker_media(
+        candidate,
+        session_key,
+        "host file missing from sandbox",
+        enabled=log_rejections,
+    )
     return None
 
 
-def validate_media_delivery_path(path: str, session_key: str = "") -> Optional[str]:
+def validate_media_delivery_path(
+    path: str,
+    session_key: str = "",
+    *,
+    log_rejections: bool = True,
+) -> Optional[str]:
     """Return a safe absolute file path for native media delivery, else None.
 
     Default mode (single-user / private gateway): accept any existing regular
@@ -1847,7 +1878,11 @@ def validate_media_delivery_path(path: str, session_key: str = "") -> Optional[s
     # Docker agents emit MEDIA:/workspace/... (or other configured container
     # mount paths). Resolve those to host paths before the normal host-side
     # existence / denylist checks.
-    translated = _translate_docker_container_media_path(expanded, session_key=session_key)
+    translated = _translate_docker_container_media_path(
+        expanded,
+        session_key=session_key,
+        log_rejections=log_rejections,
+    )
     if translated is not None:
         resolved = translated
     else:
@@ -2116,7 +2151,12 @@ MEDIA_EXTENSIONLESS_TAG_RE = re.compile(
 )
 
 
-def _match_extensionless_path(scan_text: str, match: "re.Match") -> Optional[Tuple[str, int]]:
+def _match_extensionless_path(
+    scan_text: str,
+    match: "re.Match",
+    *,
+    log_rejections: bool = True,
+) -> Optional[Tuple[str, int]]:
     """Resolve an extensionless MEDIA tag match to a validated on-disk path.
 
     Tries the regex-captured path first. When that fails validation, the
@@ -2131,7 +2171,7 @@ def _match_extensionless_path(scan_text: str, match: "re.Match") -> Optional[Tup
     path = _normalize_media_tag_path(raw)
     if not path:
         return None
-    safe = validate_media_delivery_path(path)
+    safe = validate_media_delivery_path(path, log_rejections=log_rejections)
     if safe:
         return safe, match.end("path")
     start = match.start("path")
@@ -2151,7 +2191,10 @@ def _match_extensionless_path(scan_text: str, match: "re.Match") -> Optional[Tup
         while tok_end < len(segment) and segment[tok_end] not in " \t":
             tok_end += 1
         candidate = _normalize_media_tag_path(segment[:tok_end])
-        safe = validate_media_delivery_path(candidate)
+        safe = validate_media_delivery_path(
+            candidate,
+            log_rejections=log_rejections,
+        )
         if safe:
             return safe, start + tok_end
         pos = tok_end
@@ -5022,9 +5065,18 @@ class BasePlatformAdapter(ABC):
         return await self.send(chat_id=chat_id, content=text, reply_to=reply_to, metadata=metadata)
 
     @staticmethod
-    def validate_media_delivery_path(path: str, session_key: str = "") -> Optional[str]:
+    def validate_media_delivery_path(
+        path: str,
+        session_key: str = "",
+        *,
+        log_rejections: bool = True,
+    ) -> Optional[str]:
         """Return a resolved path if it is safe for native attachment upload."""
-        return validate_media_delivery_path(path, session_key=session_key)
+        return validate_media_delivery_path(
+            path,
+            session_key=session_key,
+            log_rejections=log_rejections,
+        )
 
     @staticmethod
     def filter_media_delivery_paths(media_files, session_key: str = "") -> List[Tuple[str, bool]]:
@@ -5145,7 +5197,11 @@ class BasePlatformAdapter(ABC):
         return ''.join(chars)
 
     @staticmethod
-    def extract_media(content: str) -> Tuple[List[Tuple[str, bool]], str]:
+    def extract_media(
+        content: str,
+        *,
+        log_rejections: bool = True,
+    ) -> Tuple[List[Tuple[str, bool]], str]:
         """
         Extract MEDIA:<path> tags and [[audio_as_voice]] directives from response text.
 
@@ -5224,7 +5280,11 @@ class BasePlatformAdapter(ABC):
             path = _normalize_media_tag_path(match.group("path"))
             if not path or not _path_lacks_deliverable_extension(path):
                 continue
-            resolved = _match_extensionless_path(scan_content, match)
+            resolved = _match_extensionless_path(
+                scan_content,
+                match,
+                log_rejections=log_rejections,
+            )
             if resolved is None:
                 continue
             safe = resolved[0]
@@ -5249,7 +5309,11 @@ class BasePlatformAdapter(ABC):
                 path = _normalize_media_tag_path(match.group("path"))
                 if not path or not _path_lacks_deliverable_extension(path):
                     continue
-                resolved = _match_extensionless_path(masked_cleaned, match)
+                resolved = _match_extensionless_path(
+                    masked_cleaned,
+                    match,
+                    log_rejections=log_rejections,
+                )
                 if resolved is not None:
                     spans.append((match.start(), resolved[1]))
             if spans:

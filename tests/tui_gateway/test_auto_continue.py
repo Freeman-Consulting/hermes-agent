@@ -352,6 +352,94 @@ def test_older_agent_still_gets_the_post_turn_stamp(emits, turn_env, marker_home
     assert stamped == [("session-key", "auto_continue")]
 
 
+def test_mobile_media_result_is_path_free_in_stream_complete_and_history(
+    emits,
+    turn_env,
+    marker_home,
+    monkeypatch,
+    tmp_path,
+):
+    from hermes_cli.mobile_artifacts import _reset_for_tests as reset_artifact_stores
+
+    monkeypatch.setenv("HERMES_HOME", str(marker_home))
+    reset_artifact_stores()
+    source = tmp_path / "generated.txt"
+    source.write_text("bounded result", encoding="utf-8")
+    raw = f"Generated.\nMEDIA:{source}"
+
+    class _ArtifactDB:
+        def __init__(self):
+            self.metadata = None
+
+        def merge_latest_message_display_metadata(
+            self, session_id, *, role, display_metadata
+        ):
+            self.metadata = (session_id, role, display_metadata)
+            return True
+
+    db = _ArtifactDB()
+
+    def _run(message, conversation_history=None, stream_callback=None, **_kwargs):
+        assert stream_callback is not None
+        stream_callback("Generated.\nME")
+        stream_callback(f"DIA:{source}")
+        agent.session_id = "continuation-key"
+        return {
+            "final_response": raw,
+            "messages": [
+                {"role": "user", "content": str(message)},
+                {"role": "assistant", "content": raw},
+            ],
+        }
+
+    agent = types.SimpleNamespace(
+        session_id="session-key",
+        run_conversation=_run,
+        clear_interrupt=lambda: None,
+        _session_db=db,
+    )
+    session = _session(
+        agent=agent,
+        running=True,
+        source="ios-pocket",
+        profile_home=str(marker_home),
+    )
+    monkeypatch.setattr(
+        server,
+        "_sync_session_key_after_compress",
+        lambda _sid, target, **_kwargs: target.__setitem__(
+            "session_key", agent.session_id
+        ),
+    )
+
+    server._run_prompt_submit("rid", "sid", session, "make an artifact")
+
+    deltas = "".join(
+        str(payload.get("text") or "")
+        for event, _sid, payload in emits
+        if event == "message.delta" and isinstance(payload, dict)
+    )
+    complete = next(
+        payload
+        for event, _sid, payload in emits
+        if event == "message.complete" and isinstance(payload, dict)
+    )
+    history = server._history_to_messages(session["history"])
+
+    assert deltas == "Generated.\n"
+    assert "MEDIA:" not in deltas
+    assert str(source) not in deltas
+    assert complete["text"] == "Generated."
+    assert complete["durable_session_id"] == "continuation-key"
+    assert len(complete["attachments"]) == 1
+    assert history[-1]["text"] == complete["text"]
+    assert history[-1]["attachments"] == complete["attachments"]
+    assert db.metadata is not None
+    assert db.metadata[0] == "continuation-key"
+    assert db.metadata[2]["attachments"] == complete["attachments"]
+    reset_artifact_stores()
+
+
 # ── Scheduling decision ────────────────────────────────────────────────
 
 

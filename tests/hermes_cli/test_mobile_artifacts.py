@@ -24,8 +24,11 @@ from hermes_cli.mobile_artifacts import (
     MobileArtifactScopeMismatch,
     MobileArtifactStore,
     MobileArtifactTooLarge,
+    MOBILE_ARTIFACT_MAX_BYTES,
     _reset_for_tests as reset_artifact_stores,
+    load_mobile_artifact,
     publish_mobile_artifact,
+    publish_mobile_artifact_path,
     validate_attachment_descriptor,
 )
 from tui_gateway import server as gateway_server
@@ -228,6 +231,7 @@ def test_authenticated_download_route_is_opaque_scoped_and_repeatable(
     assert first.status_code == 200
     assert second.status_code == 200
     assert first.content == b"downloadable-result"
+    assert second.content == b"downloadable-result"
     assert first.headers["content-type"].startswith("text/plain")
     assert first.headers["cache-control"] == "no-store"
     assert first.headers["x-content-type-options"] == "nosniff"
@@ -251,3 +255,60 @@ def test_authenticated_download_route_is_opaque_scoped_and_repeatable(
         json={**request_body, "device_secret": "wrong"},
     )
     assert bad_credential.status_code == 401
+
+
+def test_publish_path_reads_regular_file_once_and_returns_path_free_descriptor(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "generated" / "report.txt"
+    source.parent.mkdir()
+    source.write_bytes(b"bounded-result")
+
+    descriptor = publish_mobile_artifact_path(
+        path=source,
+        profile="default",
+        session_id="session-1",
+    )
+    payload = load_mobile_artifact(
+        artifact_id=descriptor["id"],
+        profile="default",
+        session_id="session-1",
+    )
+
+    assert payload.data == b"bounded-result"
+    assert descriptor["name"] == "report.txt"
+    assert descriptor["mime_type"] == "text/plain"
+    assert str(source) not in json.dumps(descriptor)
+
+
+def test_publish_path_rejects_sparse_file_above_cap_before_reading(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "oversized.bin"
+    with source.open("wb") as handle:
+        handle.seek(MOBILE_ARTIFACT_MAX_BYTES)
+        handle.write(b"x")
+
+    with pytest.raises(MobileArtifactTooLarge):
+        publish_mobile_artifact_path(
+            path=source,
+            profile="default",
+            session_id="session-1",
+        )
+
+    artifact_root = tmp_path / "artifacts" / "mobile-v1"
+    assert not artifact_root.exists() or list(artifact_root.iterdir()) == []
+
+
+def test_publish_path_rejects_symlink_source(tmp_path: Path) -> None:
+    target = tmp_path / "target.txt"
+    target.write_text("not accepted through a symlink", encoding="utf-8")
+    source = tmp_path / "alias.txt"
+    source.symlink_to(target)
+
+    with pytest.raises(MobileArtifactCorrupt):
+        publish_mobile_artifact_path(
+            path=source,
+            profile="default",
+            session_id="session-1",
+        )

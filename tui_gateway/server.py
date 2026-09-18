@@ -9708,6 +9708,88 @@ def _history_attachment_projection(
     return display_text, attachments, safe_metadata
 
 
+def _apply_mobile_artifact_projection(result: Any, session: dict, agent: Any) -> list[dict]:
+    """Project one completed iOS result into live and durable path-free forms."""
+
+    if not isinstance(result, dict):
+        return []
+    response_text = result.get("final_response")
+    if not isinstance(response_text, str):
+        return []
+
+    from tui_gateway.mobile_artifact_results import (
+        MOBILE_ARTIFACT_SOURCE,
+        MobileArtifactProjection,
+        profile_name_from_home,
+        project_mobile_artifact_result,
+        strict_mobile_display_text,
+    )
+
+    source = _session_source(session)
+    try:
+        projection = project_mobile_artifact_result(
+            response_text=response_text,
+            source=source,
+            profile=profile_name_from_home(session.get("profile_home")),
+            session_id=str(
+                getattr(agent, "session_id", "") or session.get("session_key") or ""
+            ),
+            session_key=str(session.get("session_key") or ""),
+        )
+    except Exception:
+        if source != MOBILE_ARTIFACT_SOURCE:
+            return []
+        logger.warning("Mobile artifact result projection failed")
+        safe_text = strict_mobile_display_text(response_text)
+        notice = "Attachment unavailable."
+        projection = MobileArtifactProjection(
+            display_text=f"{safe_text}\n\n{notice}" if safe_text else notice,
+            attachments=[],
+            failed_count=1,
+        )
+    if projection is None:
+        return []
+
+    attachments = _canonical_attachment_descriptors(projection.attachments)
+    display_metadata = {
+        "attachments": attachments,
+        "display_text": projection.display_text,
+    }
+    result["final_response"] = projection.display_text
+    result["attachments"] = attachments
+
+    messages = result.get("messages")
+    if isinstance(messages, list):
+        for message in reversed(messages):
+            if not isinstance(message, dict) or message.get("role") != "assistant":
+                continue
+            existing = message.get("display_metadata")
+            merged = dict(existing) if isinstance(existing, dict) else {}
+            merged.update(display_metadata)
+            message["display_metadata"] = merged
+            break
+
+    session_id = str(getattr(agent, "session_id", "") or session.get("session_key") or "")
+    session_db = getattr(agent, "_session_db", None)
+    merge_metadata = getattr(session_db, "merge_latest_message_display_metadata", None)
+    if callable(merge_metadata) and session_id:
+        try:
+            persisted = bool(
+                merge_metadata(
+                    session_id,
+                    role="assistant",
+                    display_metadata=display_metadata,
+                )
+            )
+        except Exception:
+            persisted = False
+        if not persisted:
+            # Never include exception text: storage errors can carry local paths.
+            logger.warning("Mobile artifact transcript projection was not persisted")
+
+    return attachments
+
+
 def _history_to_messages(history: list[dict]) -> list[dict]:
     messages = []
     tool_call_args = {}
@@ -11170,10 +11252,18 @@ def _live_session_payload(
     else:
         with _session_db(session) as db:
             history = _live_visible_history(session, db, in_memory_history)
+    projected_messages = [] if omit_messages else _history_to_messages(history)
+    if _session_source(session) == "ios-pocket":
+        from tui_gateway.mobile_artifact_results import project_mobile_history_message
+
+        projected_messages = [
+            project_mobile_history_message(message)
+            for message in projected_messages
+        ]
     payload = {
         "info": _fallback_session_info(session),
         "message_count": len(history),
-        "messages": [] if omit_messages else _history_to_messages(history),
+        "messages": projected_messages,
         "messages_omitted": omit_messages,
         "running": running,
         "turn_started_at": turn_started_at,
@@ -13201,14 +13291,25 @@ def _run_prompt_submit(
             # state, so it cannot live in the (byte-stable) system prompt.
             run_message = _prepend_note(run_message, _hud_surface_note(session))
 
+            mobile_stream_filter = None
+            if _session_source(session) == "ios-pocket":
+                from tui_gateway.mobile_artifact_results import MobileArtifactStreamFilter
+
+                mobile_stream_filter = MobileArtifactStreamFilter()
+
             def _stream(delta):
+                visible_delta = delta
+                if mobile_stream_filter is not None and isinstance(delta, str):
+                    visible_delta = mobile_stream_filter.feed(delta)
+                    if not visible_delta:
+                        return
                 with session["history_lock"]:
-                    _append_inflight_delta(session, delta)
-                payload = {"text": delta}
-                if streamer and (r := streamer.feed(delta)) is not None:
+                    _append_inflight_delta(session, visible_delta)
+                payload = {"text": visible_delta}
+                if streamer and (r := streamer.feed(visible_delta)) is not None:
                     payload["rendered"] = r
-                if tts_queue is not None and isinstance(delta, str):
-                    tts_queue.put(delta)
+                if tts_queue is not None and isinstance(visible_delta, str):
+                    tts_queue.put(visible_delta)
                 _emit("message.delta", sid, payload)
 
             # Surface interim assistant text (commentary emitted alongside
@@ -13218,8 +13319,15 @@ def _run_prompt_submit(
             # Gated on display.interim_assistant_messages (default true).
             if _load_interim_assistant_messages():
                 def _interim_assistant_cb(text: str, *, already_streamed: bool = False) -> None:
+                    visible_text = text
+                    if mobile_stream_filter is not None:
+                        from tui_gateway.mobile_artifact_results import strict_mobile_display_text
+
+                        visible_text = strict_mobile_display_text(text)
+                        if not visible_text:
+                            return
                     _emit("message.interim", sid, {
-                        "text": text,
+                        "text": visible_text,
                         "already_streamed": already_streamed,
                     })
 
@@ -13276,6 +13384,17 @@ def _run_prompt_submit(
                 # message.complete.
                 _usage_stop.set()
                 _usage_thread.join()
+            if mobile_stream_filter is not None:
+                visible_tail = mobile_stream_filter.finish()
+                if visible_tail:
+                    with session["history_lock"]:
+                        _append_inflight_delta(session, visible_tail)
+                    tail_payload = {"text": visible_tail}
+                    if streamer and (rendered_tail := streamer.feed(visible_tail)) is not None:
+                        tail_payload["rendered"] = rendered_tail
+                    if tts_queue is not None:
+                        tts_queue.put(visible_tail)
+                    _emit("message.delta", sid, tail_payload)
             if display_kind and isinstance(text, str):
                 db = getattr(agent, "_session_db", None)
                 current_session_id = getattr(agent, "session_id", None) or session.get("session_key")
@@ -13297,6 +13416,7 @@ def _run_prompt_submit(
                             if display_metadata:
                                 message["display_metadata"] = display_metadata
                             break
+            _apply_mobile_artifact_projection(result, session, agent)
             if "moa_one_shot_restore" in session:
                 _restore = session.pop("moa_one_shot_restore", None)
                 # Restore the model the user was on before the /moa one-shot.
@@ -13453,6 +13573,10 @@ def _run_prompt_submit(
                 status = "complete"
 
             payload = {"text": raw, "usage": _get_usage(agent), "status": status}
+            if _session_source(session) == "ios-pocket":
+                durable_session_id = str(session.get("session_key") or "").strip()
+                if durable_session_id:
+                    payload["durable_session_id"] = durable_session_id
             result_attachments = _canonical_attachment_descriptors(
                 result.get("attachments") if isinstance(result, dict) else None
             )
