@@ -236,8 +236,18 @@ def _(rid, params: dict) -> dict:
                                 "title": row.get("title") or "",
                                 "preview": tip_row.get("preview") or "",
                                 "started_at": row.get("started_at") or 0,
+                                "last_active": (
+                                    tip_row.get("last_active")
+                                    or tip_row.get("last_activity_at")
+                                    or tip_row.get("started_at")
+                                    or row.get("started_at")
+                                    or 0
+                                ),
                                 "message_count": tip_row.get("message_count") or 0,
                                 "source": row.get("source") or "",
+                                "is_active": bool(tip_row.get("is_active")),
+                                "pinned": bool(tip_row.get("pinned")),
+                                "archived": bool(tip_row.get("archived")),
                             }
                         ]
                     },
@@ -273,8 +283,17 @@ def _(rid, params: dict) -> dict:
                             "title": s.get("title") or "",
                             "preview": s.get("preview") or "",
                             "started_at": s.get("started_at") or 0,
+                            "last_active": (
+                                s.get("last_active")
+                                or s.get("last_activity_at")
+                                or s.get("started_at")
+                                or 0
+                            ),
                             "message_count": s.get("message_count") or 0,
                             "source": s.get("source") or "",
+                            "is_active": bool(s.get("is_active")),
+                            "pinned": bool(s.get("pinned")),
+                            "archived": bool(s.get("archived")),
                         }
                         for s in rows
                     ]

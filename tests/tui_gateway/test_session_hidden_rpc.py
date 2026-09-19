@@ -69,3 +69,19 @@ def test_session_list_include_hidden(db):
 
     all_rows = _call("session.list", {"include_hidden": True})["result"]["sessions"]
     assert {s["id"] for s in all_rows} == {"plain-chat", "bot-chat"}
+
+
+def test_session_list_projects_authoritative_recency_and_list_flags(db):
+    _seed(db, "mobile-chat")
+    db._conn.execute(
+        "UPDATE sessions SET last_activity_at = ?, pinned = 1 WHERE id = ?",
+        (222.0, "mobile-chat"),
+    )
+    db._conn.commit()
+
+    rows = _call("session.list", {})["result"]["sessions"]
+    row = next(item for item in rows if item["id"] == "mobile-chat")
+
+    assert row["last_active"] == 222.0
+    assert row["pinned"] is True
+    assert row["archived"] is False
