@@ -113,12 +113,35 @@ def _(rid, params: dict) -> dict:
         }
         _register_session_cwd(_sessions[sid])
 
-    # NOTE: we intentionally do NOT persist a DB row here. Every TUI/desktop
-    # launch (and every "New agent" / draft) opens a session here just to paint
-    # the composer, so eagerly creating a row left an "Untitled" empty session
-    # behind for every launch the user never typed into. The row is now created
-    # lazily on the first prompt (see _ensure_session_db_row + prompt.submit),
-    # and the AIAgent's own INSERT-OR-IGNORE persists it on the first turn too.
+    # Mobile creates a durable conversation explicitly from the New sheet. It
+    # must survive navigation before the first prompt, unlike desktop/TUI's
+    # implicit composer drafts. Persist only this explicit ios-pocket contract
+    # so opening the new chat can read empty history and the list can reopen its
+    # keyed draft without reintroducing abandoned desktop "Untitled" rows.
+    if source == "ios-pocket":
+        mobile_session = _sessions[sid]
+        try:
+            if _ensure_session_db_row(mobile_session) is False:
+                _sessions.pop(sid, None)
+                return _db_unavailable_error(rid, code=5007)
+            if title:
+                with _session_db(mobile_session) as mobile_db:
+                    if mobile_db is None:
+                        _sessions.pop(sid, None)
+                        return _db_unavailable_error(rid, code=5007)
+                    if not mobile_db.set_session_title(key, title):
+                        _sessions.pop(sid, None)
+                        return _err(rid, 5007, "failed to persist mobile session title")
+                mobile_session["pending_title"] = None
+        except Exception as exc:
+            _sessions.pop(sid, None)
+            return _err(rid, 5007, str(exc))
+
+    # Desktop/TUI intentionally do NOT persist a DB row here. Every TUI/desktop
+    # launch opens a composer, so eagerly creating a row left an "Untitled"
+    # empty session behind for every launch the user never typed into. Those
+    # rows remain lazy until the first prompt; ios-pocket is the explicit
+    # user-created exception above.
 
     # Return the lightweight session immediately so Ink can paint the composer
     # + skeleton panel, then build the real AIAgent just after this response is

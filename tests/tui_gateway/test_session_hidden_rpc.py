@@ -102,3 +102,25 @@ def test_session_history_reads_durable_session_without_live_resume(db):
         "latest durable question",
         "latest durable answer",
     ]
+
+
+def test_mobile_session_create_persists_empty_durable_row(db):
+    envelope = _call(
+        "session.create",
+        {"cols": 80, "source": "ios-pocket", "title": "Gerard"},
+    )
+
+    assert envelope.get("error") is None, envelope
+    result = envelope["result"]
+    stored_id = result["stored_session_id"]
+    assert db.get_session(stored_id) is not None
+
+    rows = _call("session.list", {})["result"]["sessions"]
+    created = next(row for row in rows if row["id"] == stored_id)
+    assert created["title"] == "Gerard"
+    assert created["message_count"] == 0
+
+    history = _call("session.history", {"session_id": stored_id})
+    assert history.get("error") is None, history
+    assert history["result"]["session_id"] == stored_id
+    assert history["result"]["messages"] == []
