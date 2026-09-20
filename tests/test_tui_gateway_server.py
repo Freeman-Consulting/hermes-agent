@@ -5014,6 +5014,112 @@ def test_ws_orphan_reap_interrupts_in_process_turn(monkeypatch):
         server._sessions.pop("inline-sid", None)
 
 
+def test_ws_orphan_reap_allows_ios_pocket_turn_to_finish_then_reaps(monkeypatch):
+    callbacks = []
+    interrupted = []
+    torn_down = []
+
+    class _Timer:
+        def __init__(self, _delay, callback):
+            callbacks.append(callback)
+
+        def start(self):
+            return None
+
+    session = _session(
+        source="ios-pocket",
+        transport=server._detached_ws_transport,
+        running=True,
+    )
+    server._sessions["mobile-sid"] = session
+    monkeypatch.setattr(server, "_WS_ORPHAN_REAP_GRACE_S", 0.01)
+    monkeypatch.setattr(server.threading, "Timer", _Timer)
+    monkeypatch.setattr(
+        server,
+        "_interrupt_session_turn",
+        lambda *_args, **_kwargs: interrupted.append("interrupted") or False,
+    )
+    monkeypatch.setattr(
+        server,
+        "_teardown_popped_session",
+        lambda claimed, *, end_reason: torn_down.append((claimed, end_reason)) or True,
+    )
+
+    try:
+        server._schedule_ws_orphan_reap("mobile-sid")
+        callbacks.pop(0)()
+
+        assert interrupted == []
+        assert "mobile-sid" in server._sessions
+        assert len(callbacks) == 1
+
+        session["running"] = False
+        callbacks.pop(0)()
+
+        assert "mobile-sid" not in server._sessions
+        assert torn_down == [(session, "ws_orphan_reap")]
+    finally:
+        server._sessions.pop("mobile-sid", None)
+
+
+def test_ws_orphan_reap_interrupts_ios_pocket_turn_after_completion_window(monkeypatch):
+    callbacks = []
+    interrupted = []
+
+    class _Timer:
+        def __init__(self, _delay, callback):
+            callbacks.append(callback)
+
+        def start(self):
+            return None
+
+    session = _session(
+        source="ios-pocket",
+        transport=server._detached_ws_transport,
+        running=True,
+        _ios_pocket_detached_turn_started_at=10.0,
+    )
+    server._sessions["hung-mobile-sid"] = session
+    monkeypatch.setattr(server, "_WS_ORPHAN_REAP_GRACE_S", 0.01)
+    monkeypatch.setattr(server, "_IOS_POCKET_DETACHED_TURN_MAX_SECONDS", 30.0)
+    monkeypatch.setattr(server.time, "monotonic", lambda: 41.0)
+    monkeypatch.setattr(server.threading, "Timer", _Timer)
+    monkeypatch.setattr(
+        server,
+        "_interrupt_session_turn",
+        lambda *_args, **_kwargs: interrupted.append("interrupted") or False,
+    )
+
+    try:
+        server._schedule_ws_orphan_reap("hung-mobile-sid")
+        callbacks.pop(0)()
+
+        assert interrupted == ["interrupted"]
+        assert session["_client_gone_interrupt_requested"] is True
+        assert len(callbacks) == 1
+    finally:
+        server._sessions.pop("hung-mobile-sid", None)
+
+
+def test_ws_orphan_reap_reattach_resets_ios_pocket_completion_window(monkeypatch):
+    session = _session(
+        source="ios-pocket",
+        _ios_pocket_detached_turn_started_at=10.0,
+    )
+    timer = threading.Timer(60.0, lambda: None)
+    server._sessions["reattached-mobile-sid"] = session
+    server._pending_ws_reaps["reattached-mobile-sid"] = timer
+
+    try:
+        server._cancel_ws_orphan_reap("reattached-mobile-sid")
+
+        assert "_ios_pocket_detached_turn_started_at" not in session
+        assert "reattached-mobile-sid" not in server._pending_ws_reaps
+    finally:
+        server._pending_ws_reaps.pop("reattached-mobile-sid", None)
+        server._sessions.pop("reattached-mobile-sid", None)
+
+
 def test_ws_disconnect_running_sidecar_still_closes_without_orphan_timer(monkeypatch):
     closed = []
     scheduled = []

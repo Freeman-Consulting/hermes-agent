@@ -213,6 +213,12 @@ _WS_ORPHAN_INTERRUPT_REAP_POLL_S = 1.0
 # many polls we log loudly and force-reap, mirroring the pre-existing
 # stuck-`running` safety net's role of breaking the deadlock.
 _WS_ORPHAN_INTERRUPT_REAP_MAX_POLLS = 60
+# A locked iPhone normally drops its WebSocket while the durable mobile turn
+# continues.  Unlike a refreshed dashboard tab, an ``ios-pocket`` client is
+# expected to resume the same stored session later.  Give that detached turn a
+# bounded completion window, then fall back to the ordinary interrupt/reap
+# safety path if the worker is genuinely stuck.
+_IOS_POCKET_DETACHED_TURN_MAX_SECONDS = 60.0 * 60.0
 _TURN_SETTLE_BEFORE_CLOSE_SECONDS = 5.0
 _DETAIL_SECTION_NAMES = ("thinking", "tools", "subagents", "activity")
 _DETAIL_MODES = frozenset({"hidden", "collapsed", "expanded"})
@@ -1387,6 +1393,9 @@ def _cancel_ws_orphan_reap(sid: str) -> None:
     """
     with _sessions_lock:
         timer = _pending_ws_reaps.pop(sid, None)
+        session = _sessions.get(sid)
+        if session is not None:
+            session.pop("_ios_pocket_detached_turn_started_at", None)
     if timer is not None:
         try:
             timer.cancel()
@@ -1434,26 +1443,45 @@ def _schedule_ws_orphan_reap(sid: str, *, delay_s: float | None = None) -> None:
                 # Timer (#85578): after the reconnect grace the turn is
                 # interrupted once, then the reap keeps polling until the
                 # normal turn-finalization path settles.
-                polls = int(current.get("_client_gone_interrupt_polls") or 0) + 1
-                current["_client_gone_interrupt_polls"] = polls
-                if polls > _WS_ORPHAN_INTERRUPT_REAP_MAX_POLLS:
+                should_defer_mobile_turn = False
+                mobile_detached_started = current.get(
+                    "_ios_pocket_detached_turn_started_at"
+                )
+                if _session_source(current) == "ios-pocket" and not current.get(
+                    "_client_gone_interrupt_requested"
+                ):
+                    now = time.monotonic()
+                    if mobile_detached_started is None:
+                        mobile_detached_started = now
+                        current["_ios_pocket_detached_turn_started_at"] = now
+                    should_defer_mobile_turn = (
+                        now - float(mobile_detached_started)
+                        < _IOS_POCKET_DETACHED_TURN_MAX_SECONDS
+                    )
+                    if should_defer_mobile_turn:
+                        reschedule_delay = _WS_ORPHAN_REAP_GRACE_S
+
+                if not should_defer_mobile_turn:
+                    polls = int(current.get("_client_gone_interrupt_polls") or 0) + 1
+                    current["_client_gone_interrupt_polls"] = polls
+                    if polls > _WS_ORPHAN_INTERRUPT_REAP_MAX_POLLS:
                     # The interrupted turn never settled inside the budget —
                     # force-reap rather than parking the session + a timer
                     # chain forever. Loud by design: this only fires when a
                     # turn is genuinely stuck past interrupt.
-                    logger.error(
-                        "client_gone sid=%s: turn did not settle after %d "
-                        "interrupt polls (%.0fs) — force-reaping detached "
-                        "session",
-                        sid, polls - 1,
-                        (polls - 1) * _WS_ORPHAN_INTERRUPT_REAP_POLL_S,
-                    )
-                    session = _pop_session_by_id(sid)
-                else:
-                    if not current.get("_client_gone_interrupt_requested"):
-                        current["_client_gone_interrupt_requested"] = True
-                        interrupt_session = current
-                    reschedule_delay = _WS_ORPHAN_INTERRUPT_REAP_POLL_S
+                        logger.error(
+                            "client_gone sid=%s: turn did not settle after %d "
+                            "interrupt polls (%.0fs) — force-reaping detached "
+                            "session",
+                            sid, polls - 1,
+                            (polls - 1) * _WS_ORPHAN_INTERRUPT_REAP_POLL_S,
+                        )
+                        session = _pop_session_by_id(sid)
+                    else:
+                        if not current.get("_client_gone_interrupt_requested"):
+                            current["_client_gone_interrupt_requested"] = True
+                            interrupt_session = current
+                        reschedule_delay = _WS_ORPHAN_INTERRUPT_REAP_POLL_S
             else:
                 session = _pop_session_by_id(sid)
 
