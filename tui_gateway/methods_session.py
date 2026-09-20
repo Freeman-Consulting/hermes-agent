@@ -3036,9 +3036,46 @@ def _(rid, params: dict) -> dict:
 def _(rid, params: dict) -> dict:
     session, err = _sess_nowait(params, rid)
     if err:
-        return err
+        # Read-only durable fallback: clients such as Hermes Mobile browse
+        # sessions owned by CLI, dashboard, and other runtimes. Reading their
+        # persisted transcript must not require session.resume or instantiate a
+        # competing live runtime in this Gateway process.
+        target = str(params.get("session_id") or "").strip()
+        with _profile_db(params) as db:
+            if db is None:
+                return _db_unavailable_error(rid, code=5007)
+            try:
+                resolved = (
+                    db.resolve_session_id(target)
+                    if hasattr(db, "resolve_session_id")
+                    else target
+                )
+                if not resolved:
+                    return err
+                history = db.get_messages_as_conversation(
+                    resolved,
+                    include_ancestors=True,
+                    include_row_ids=True,
+                )
+                return _ok(
+                    rid,
+                    {
+                        "session_id": resolved,
+                        "count": len(history),
+                        "messages": _history_to_messages(history),
+                    },
+                )
+            except Exception as exc:
+                return _err(rid, 5007, str(exc))
+
     history = list(session.get("history", []))
-    if session.get("session_key"):
+    session_key = str(
+        session.get("session_key")
+        or session.get("session_id")
+        or params.get("session_id")
+        or ""
+    )
+    if session_key:
         with _session_db(session) as db:
             if db is not None:
                 try:
@@ -3049,7 +3086,7 @@ def _(rid, params: dict) -> dict:
                     # when the row carries a stamp, so an unstamped read here
                     # silently strips the one durable address clients can use.
                     history = db.get_messages_as_conversation(
-                        session["session_key"],
+                        session_key,
                         include_ancestors=True,
                         include_row_ids=True,
                     )
@@ -3058,6 +3095,7 @@ def _(rid, params: dict) -> dict:
     return _ok(
         rid,
         {
+            "session_id": session_key,
             "count": len(history),
             "messages": _history_to_messages(history),
         },

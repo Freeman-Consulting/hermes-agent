@@ -85,3 +85,20 @@ def test_session_list_projects_authoritative_recency_and_list_flags(db):
     assert row["last_active"] == 222.0
     assert row["pinned"] is True
     assert row["archived"] is False
+
+
+def test_session_history_reads_durable_session_without_live_resume(db):
+    _seed(db, "durable-chat")
+    db.append_message("durable-chat", "user", "latest durable question")
+    db.append_message("durable-chat", "assistant", "latest durable answer")
+
+    envelope = _call("session.history", {"session_id": "durable-chat"})
+
+    assert envelope.get("error") is None, envelope
+    result = envelope["result"]
+    assert result["session_id"] == "durable-chat"
+    assert [row["role"] for row in result["messages"]] == ["user", "assistant"]
+    assert [row.get("content") or row.get("text") for row in result["messages"]] == [
+        "latest durable question",
+        "latest durable answer",
+    ]
