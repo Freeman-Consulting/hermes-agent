@@ -11,12 +11,26 @@ import pytest
 from gateway import hosted_room_driver as driver
 from gateway import hosted_rooms as rooms
 import hermes_state
+import hermes_constants
 from gateway.hosted_room_policy_checkpoint import HostedRoomPolicyCheckpoint
 from hermes_state import SessionDB
 
 USER = {"kind": "user", "id": "desktop-user", "display_name": "User"}
 GATEWAY_A = {"kind": "gateway", "id": "gateway-a"}
 GATEWAY_B = {"kind": "gateway", "id": "gateway-b"}
+
+
+def test_hosted_rooms_use_shared_store_for_default_and_profile(monkeypatch, tmp_path):
+    root = tmp_path / "hermes"
+    for home in (root, root / "profiles" / "etrac", root / "profiles" / "fletch"):
+        monkeypatch.setattr(hermes_constants, "get_hermes_home", lambda home=home: home)
+        path = rooms.default_db_path()
+        assert path == root / "shared-state.db"
+        with rooms._connect(path) as conn:
+            assert conn.execute(
+                "SELECT name FROM sqlite_master WHERE name='hosted_rooms'"
+            ).fetchone() is not None
+    assert not (root / "state.db").exists()
 
 
 def _create_pre_actor_database(path) -> None:

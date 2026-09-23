@@ -267,12 +267,12 @@ def _migrate_remote_run_schema(conn: sqlite3.Connection) -> None:
 
 
 def default_db_path() -> Path:
-    """Return the gateway-wide state database for the active install."""
+    """Use the shared room store, never the master session database."""
     from hermes_constants import get_hermes_home
 
     home = get_hermes_home()
     root = home.parent.parent if home.parent.name == "profiles" else home
-    return root / "state.db"
+    return root / "shared-state.db"
 
 
 def local_authority_gateway_id() -> str:
@@ -1121,7 +1121,7 @@ def _connect(db_path: Path | str) -> sqlite3.Connection:
     try:
         for attempt in range(_JOURNAL_MODE_LOCK_RETRIES):
             try:
-                apply_wal_with_fallback(conn, db_label="state.db (hosted_rooms)")
+                apply_wal_with_fallback(conn, db_label="shared-state.db (hosted_rooms)")
                 break
             except sqlite3.OperationalError as exc:
                 if (
