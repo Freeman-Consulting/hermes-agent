@@ -241,6 +241,46 @@ _LIST_SESSIONS_PAGE_SIZE = 50
 # the total; aggregator providers stay intentionally uncapped inside the shared
 # inventory, and the current model is always kept via the fallback insert below.
 ACP_MAX_MODELS_PER_PROVIDER = 200
+
+
+def _acp_model_allowlist() -> list[str]:
+    """``acp.models`` from config.yaml: ``provider:model`` ids or fnmatch globs
+    (e.g. ``openai-codex:*``). Empty/missing means no filtering."""
+    try:
+        from hermes_cli.config import load_config
+
+        raw = (load_config().get("acp") or {}).get("models")
+    except Exception:
+        return []
+    if isinstance(raw, str):
+        raw = [raw]
+    if not isinstance(raw, (list, tuple)):
+        return []
+    return [str(p).strip() for p in raw if str(p or "").strip()]
+
+
+def _apply_acp_model_allowlist(models: list, current_model_id: str = "") -> list:
+    """Keep picker entries whose ``model_id`` matches the allowlist, in
+    allowlist order; the current model is always kept (first if unlisted)."""
+    import fnmatch
+
+    patterns = _acp_model_allowlist()
+    if not patterns:
+        return models
+    kept: list = []
+    seen: set[str] = set()
+    for pattern in patterns:
+        pat = pattern.lower()
+        for item in models:
+            mid = str(getattr(item, "model_id", "") or "")
+            if mid not in seen and fnmatch.fnmatchcase(mid.lower(), pat):
+                kept.append(item)
+                seen.add(mid)
+    if current_model_id and current_model_id not in seen:
+        current = next((m for m in models if getattr(m, "model_id", "") == current_model_id), None)
+        if current is not None:
+            kept.insert(0, current)
+    return kept
 _MAX_ACP_RESOURCE_BYTES = 512 * 1024
 _TEXT_RESOURCE_MIME_PREFIXES = ("text/",)
 _TEXT_RESOURCE_MIME_TYPES = {
@@ -954,6 +994,11 @@ class HermesACPAgent(acp.Agent):
                         description=f"Provider: {provider_name} • current",
                     ),
                 )
+
+            # Optional user allowlist (config.yaml ``acp.models``) trims the
+            # editor picker. The current model always stays visible so the
+            # client can render the active selection.
+            available_models = _apply_acp_model_allowlist(available_models, current_model_id)
 
             if not available_models and current_is_empty:
                 return SessionModelState(available_models=[], current_model_id="")

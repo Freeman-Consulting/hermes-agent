@@ -653,6 +653,27 @@ class SessionManager:
         elif isinstance(model_cfg, str) and model_cfg.strip():
             default_model = model_cfg.strip()
 
+        # ACP-only default (config.yaml ``acp.default_model`` as
+        # ``provider:model`` or bare model + ``acp.default_provider``). Applies
+        # only to brand-new agents with no explicit model/provider, so restored
+        # sessions and picker switches keep what the user chose.
+        if model is None and requested_provider is None:
+            _acp_raw = config.get("acp")
+            acp_cfg: dict = _acp_raw if isinstance(_acp_raw, dict) else {}
+            acp_model = str(acp_cfg.get("default_model") or "").strip()
+            acp_provider = str(acp_cfg.get("default_provider") or "").strip() or None
+            if acp_model:
+                try:
+                    from hermes_cli.models import parse_model_input
+
+                    parsed_provider, parsed_model = parse_model_input(acp_model, "")
+                except Exception:
+                    parsed_provider, parsed_model = "", acp_model
+                default_model = parsed_model or acp_model
+                config_provider = parsed_provider or acp_provider or config_provider
+            elif acp_provider:
+                config_provider = acp_provider
+
         configured_mcp_servers = [
             name
             for name, cfg in (config.get("mcp_servers") or {}).items()
