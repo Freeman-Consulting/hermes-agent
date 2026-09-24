@@ -985,6 +985,15 @@ class HermesACPAgent(acp.Agent):
         try:
             from hermes_cli.models import detect_provider_for_model, parse_model_input
 
+            # An explicit ``provider:model`` prefix (what ACP pickers send) is
+            # authoritative. Parse with an empty current provider so a prefix
+            # that happens to equal the current provider is still recognised
+            # as explicit and never re-routed by catalog auto-detection
+            # (e.g. ``openai-codex:gpt-6-sol`` must not become OpenRouter).
+            explicit_provider, explicit_model = parse_model_input(new_model, "")
+            if explicit_provider:
+                return explicit_provider, explicit_model
+
             target_provider, new_model = parse_model_input(new_model, current_provider)
             if target_provider == current_provider:
                 detected = detect_provider_for_model(new_model, current_provider)
