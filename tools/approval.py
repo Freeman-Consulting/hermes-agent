@@ -2577,6 +2577,23 @@ _session_approved: dict[str, set] = {}
 _session_yolo: set[str] = set()
 _permanent_approved: set = set()
 
+# Per-run opt-out of the permanent (config ``command_allowlist``) approvals.
+# Editor clients (ACP) set this for the duration of one agent run so every
+# dangerous command reaches the user's approval card, while CLI/gateway
+# sessions keep honoring the allowlist. Session-scoped approvals granted in
+# that run still apply. ContextVar => isolated per concurrent session.
+_ignore_permanent_allowlist: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "ignore_permanent_allowlist", default=False
+)
+
+
+def set_ignore_permanent_allowlist(value: bool) -> contextvars.Token:
+    return _ignore_permanent_allowlist.set(bool(value))
+
+
+def reset_ignore_permanent_allowlist(token: contextvars.Token) -> None:
+    _ignore_permanent_allowlist.reset(token)
+
 
 # =========================================================================
 # Human-wait accounting (per session)
@@ -3047,7 +3064,9 @@ def is_approved(session_key: str, pattern_key: str) -> bool:
     """
     aliases = _approval_key_aliases(pattern_key)
     with _lock:
-        if any(alias in _permanent_approved for alias in aliases):
+        if not _ignore_permanent_allowlist.get() and any(
+            alias in _permanent_approved for alias in aliases
+        ):
             return True
         session_approvals = _session_approved.get(session_key, set())
         return any(alias in session_approvals for alias in aliases)
@@ -3151,6 +3170,8 @@ def _command_matches_permanent_allowlist(command: str) -> bool:
     """
     command = (command or "").strip()
     if not command:
+        return False
+    if _ignore_permanent_allowlist.get():
         return False
     if _has_allowlist_shell_operator(command):
         return False

@@ -2107,6 +2107,20 @@ class HermesACPAgent(acp.Agent):
             # contextvar (not os.environ) so concurrent executor workers don't
             # race on the flag (GHSA-96vc-wcxf-jjff).
             interactive_token = set_hermes_interactive_context(True)
+            # Editor sessions always show an approval card for dangerous
+            # commands: ignore the permanent ``command_allowlist`` (which is
+            # tuned for CLI/gateway use) for this run only, unless the user
+            # opts back in with ``acp.honor_command_allowlist: true``.
+            allowlist_token = None
+            try:
+                from hermes_cli.config import load_config_readonly
+                from tools.approval import set_ignore_permanent_allowlist
+
+                _acp_cfg = load_config_readonly().get("acp") or {}
+                if not (isinstance(_acp_cfg, dict) and _acp_cfg.get("honor_command_allowlist")):
+                    allowlist_token = set_ignore_permanent_allowlist(True)
+            except Exception:
+                logger.debug("Could not scope ACP command allowlist", exc_info=True)
             # Propagate the originating ACP session id to tools that want to
             # tag side-effects with it (e.g. ``kanban_create`` stamps it on
             # the new task so clients can render a per-session board). Save
@@ -2140,6 +2154,13 @@ class HermesACPAgent(acp.Agent):
                 # Restore the interactive contextvar for this context.
                 if interactive_token is not None:
                     reset_hermes_interactive_context(interactive_token)
+                if allowlist_token is not None:
+                    try:
+                        from tools.approval import reset_ignore_permanent_allowlist
+
+                        reset_ignore_permanent_allowlist(allowlist_token)
+                    except Exception:
+                        logger.debug("Could not restore ACP command allowlist scope", exc_info=True)
                 # Restore HERMES_SESSION_ID symmetrically.
                 if previous_session_id is None:
                     os.environ.pop("HERMES_SESSION_ID", None)
