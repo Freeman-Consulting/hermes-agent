@@ -461,6 +461,15 @@ class SessionManager:
                 except Exception:
                     logger.debug("Failed to update ACP session metadata", exc_info=True)
 
+            # Persist the workspace into the first-class cwd / git columns so
+            # ACP sessions are grouped and searchable by project like CLI/TUI
+            # sessions (model_config alone is invisible to project grouping).
+            # Only when it changed: each update_session_cwd claims a new
+            # git-metadata generation.
+            stored_cwd = (existing or {}).get("cwd") if isinstance(existing, dict) else None
+            if state.cwd and state.cwd != stored_cwd:
+                self._persist_workspace(db, state.session_id, state.cwd)
+
             # When the agent owns persistence to this same SessionDB it has
             # already flushed the live transcript incrementally during
             # run_conversation (append_message), and it preserves pre-compaction
@@ -505,6 +514,24 @@ class SessionManager:
                 )
         except Exception:
             logger.warning("Failed to persist ACP session %s", state.session_id, exc_info=True)
+
+    @staticmethod
+    def _persist_workspace(db: Any, session_id: str, cwd: str) -> None:
+        """Write cwd + git repo root/branch to the session row (best effort)."""
+        try:
+            from tui_gateway import git_probe
+
+            repo_root = git_probe.common_repo_root(cwd) or git_probe.repo_root(cwd)
+            branch = git_probe.branch(cwd) if repo_root else ""
+        except Exception:
+            logger.debug("ACP git probe failed for %s", cwd, exc_info=True)
+            repo_root, branch = "", ""
+        try:
+            db.update_session_cwd(
+                session_id, cwd, git_branch=branch or None, git_repo_root=repo_root or None
+            )
+        except Exception:
+            logger.debug("Failed to persist ACP session workspace", exc_info=True)
 
     def _restore(self, session_id: str) -> Optional[SessionState]:
         """Load a session from the database into memory, recreating the AIAgent."""
