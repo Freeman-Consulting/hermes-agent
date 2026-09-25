@@ -445,7 +445,7 @@ def _session_list_by_title(rid, db, title_lookup: str) -> dict:
     with contextlib.suppress(Exception):
         # Real compression continuation only: the resolver's unmarked-child fallback could redirect Bot Chat.
         tip = db.get_compression_tip(row["id"]) or row["id"]
-    tip_row = (db.get_session(tip) or row) if tip != row["id"] else row
+    tip_row = db.get_session_rich_row(tip, compact_rows=True) or row
     return _ok(rid, {"sessions": [_session_row_summary(row, tip_row=tip_row, resolved_id=tip)]})
 
 
