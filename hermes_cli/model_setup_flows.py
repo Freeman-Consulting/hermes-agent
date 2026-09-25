@@ -3244,8 +3244,11 @@ def _model_flow_anthropic(config, current_model=""):
             return
     print()
 
-    # Model selection
-    model_list = _PROVIDER_MODELS.get("anthropic", [])
+    # Model selection — use the same cached catalog as /model, then append
+    # models.dev additions (including models not yet in Anthropic's OAuth API).
+    from hermes_cli.models import cached_provider_model_ids, _merge_with_models_dev
+    model_list = cached_provider_model_ids("anthropic") or _PROVIDER_MODELS.get("anthropic", [])
+    model_list = list(dict.fromkeys([*model_list, *_merge_with_models_dev("anthropic", [])]))
     if model_list:
         selected = _prompt_model_selection(
             model_list,

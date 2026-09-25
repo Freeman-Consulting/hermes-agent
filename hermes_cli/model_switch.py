@@ -3341,6 +3341,10 @@ def list_authenticated_providers(
                 model_ids = curated.get(hermes_slug, []) or curated.get(pid, [])
                 if hermes_slug in _MODELS_DEV_PREFERRED:
                     model_ids = _merge_with_models_dev(hermes_slug, model_ids)
+        if hermes_slug == "anthropic":
+            # Keep Anthropic's curated/live order, adding models.dev IDs that
+            # its OAuth /v1/models endpoint has not listed yet.
+            model_ids = list(dict.fromkeys([*model_ids, *_merge_with_models_dev("anthropic", [])]))
         total = len(model_ids)
         if hermes_slug in _UNCAPPED_PICKER_PROVIDERS:
             top = model_ids  # Aggregator: show full catalog regardless of max_models
