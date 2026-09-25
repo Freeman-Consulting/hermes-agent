@@ -881,3 +881,56 @@ def test_custom_endpoint_key_env_is_a_valid_posix_name_for_ip_endpoints():
     for identity in ("127.0.0.1_8080", "0.0.0.0", "10.0.0.7:11434", "", "-–-"):
         assert _ENV_VAR_NAME_RE.match(custom_endpoint_key_env(identity)), identity
 
+
+
+def test_model_flow_anthropic_passes_live_discovery_list_to_picker(tmp_path, monkeypatch):
+    """Regression for PR #62986 review: _model_flow_anthropic() must forward
+    cached_provider_model_ids("anthropic")'s result to _prompt_model_selection()
+    rather than reading the static _PROVIDER_MODELS list directly. Patches the
+    resolver with a live-only sentinel absent from the static catalog and
+    asserts the picker receives exactly that list.
+    """
+    config_path = _seed_stale_custom_model(tmp_path, monkeypatch)
+
+    monkeypatch.setattr("hermes_cli.auth.get_anthropic_key", lambda: "sk-ant-api03-test")
+    monkeypatch.setattr(
+        "agent.anthropic_adapter.read_claude_code_credentials",
+        lambda: None,
+    )
+    monkeypatch.setattr(
+        "agent.anthropic_adapter.is_claude_code_token_valid",
+        lambda creds: False,
+    )
+    monkeypatch.setattr(
+        "hermes_cli.model_setup_flows._prompt_auth_credentials_choice",
+        lambda title: "use",
+    )
+
+    live_only_sentinel = "claude-live-only-sentinel-9999"
+    from hermes_cli.models import _PROVIDER_MODELS
+    assert live_only_sentinel not in _PROVIDER_MODELS["anthropic"]
+    monkeypatch.setattr(
+        "hermes_cli.models.cached_provider_model_ids",
+        lambda provider, **kwargs: [live_only_sentinel],
+    )
+
+    received = {}
+
+    def _fake_prompt_model_selection(model_list, **kwargs):
+        received["model_list"] = model_list
+        return live_only_sentinel
+
+    monkeypatch.setattr(
+        "hermes_cli.auth._prompt_model_selection",
+        _fake_prompt_model_selection,
+    )
+    monkeypatch.setattr("hermes_cli.auth.deactivate_provider", lambda: None)
+
+    hermes_main._model_flow_anthropic({}, current_model="glm-5.2")
+
+    assert received["model_list"] == [live_only_sentinel]
+
+    from utils import load_yaml_file_readonly
+
+    config = load_yaml_file_readonly(config_path) or {}
+    assert config["model"]["default"] == live_only_sentinel
