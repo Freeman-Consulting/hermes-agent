@@ -8021,7 +8021,42 @@ def run_conversation(
                 # chokepoint below, after final_msg is built, so it catches
                 # every path that reaches turn finalization, not just this one.)
                 final_response = assistant_message.content or ""
-                
+
+                # Leaked native tool-call markup (agent/leaked_tool_markup.py):
+                # the model meant to call a tool but the server couldn't parse
+                # the block. Retry with a corrective nudge; if it persists, fail
+                # the turn so cron doesn't log a no-op as "ok".
+                from agent import leaked_tool_markup as _ltm
+                if _ltm.has_leaked_tool_markup(final_response):
+                    _leak_n = getattr(agent, "_leaked_tool_markup_retries", 0) + 1
+                    agent._leaked_tool_markup_retries = _leak_n
+                    logger.warning(
+                        "Leaked tool-call markup in assistant content (no structured "
+                        "tool_calls), attempt %d/%d. Snippet: %r",
+                        _leak_n, _ltm.MAX_RETRIES, final_response[:200],
+                    )
+                    if _leak_n <= _ltm.MAX_RETRIES:
+                        agent._buffer_status(
+                            f"⚠️ Unparsed tool call in reply — asking model to retry "
+                            f"({_leak_n}/{_ltm.MAX_RETRIES})"
+                        )
+                        _leak_msg = agent._build_assistant_message(assistant_message, finish_reason)
+                        append_message(messages, _leak_msg)
+                        append_message(messages, {"role": "user", "content": _ltm.RETRY_NUDGE})
+                        continue
+                    _final_response = _ltm.failure_message(_ltm.MAX_RETRIES)
+                    agent._leaked_tool_markup_retries = 0
+                    agent._persist_session(messages, conversation_history)
+                    return {
+                        "final_response": _final_response,
+                        "messages": messages,
+                        "api_calls": api_call_count,
+                        "completed": False,
+                        "partial": True,
+                        "error": _final_response,
+                        "turn_exit_reason": "leaked_tool_markup_exhausted",
+                    }
+
                 # Fix: unmute output when entering the no-tool-call branch
                 # so the user can see empty-response warnings and recovery
                 # status messages.  _mute_post_response was set during a
