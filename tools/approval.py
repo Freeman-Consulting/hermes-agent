@@ -2647,7 +2647,18 @@ def human_wait_ceiling() -> float:
     hand to ``Lock.acquire(timeout=...)`` / ``Thread.join(timeout=...)``
     (#83220 macOS time_t overflow).
     """
-    return float(_get_approval_timeout()) + HUMAN_WAIT_MARGIN_S
+    base = float(_get_approval_timeout())
+    # Editor (ACP) approval cards may be configured to wait longer than
+    # approvals.timeout; the ceiling must cover the longest legitimate wait.
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        acp_raw = (load_config_readonly().get("acp") or {}).get("approval_timeout")
+        if acp_raw not in (None, ""):
+            base = max(base, min(float(acp_raw), float(365 * 24 * 3600)))
+    except Exception:
+        pass
+    return base + HUMAN_WAIT_MARGIN_S
 
 
 def _clamped_window_seconds(started: float, now: float, ceiling: float) -> float:

@@ -324,7 +324,12 @@ def make_acp_edit_approval_requester(
         if future is None:
             return False
         try:
-            response = future.result(timeout=timeout)
+            from tools.approval import human_wait_window
+
+            # A human is reading a diff card: exclude this wait from the
+            # concurrent tool-batch deadline, same as the command prompt.
+            with human_wait_window():
+                response = future.result(timeout=timeout)
         except (FutureTimeout, Exception) as exc:
             future.cancel()
             logger.warning("Edit approval request timed out or failed: %s", exc)
