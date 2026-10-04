@@ -1,6 +1,7 @@
 import asyncio
 
 from hermes_cli import web_server
+import hermes_cli.web_routers.sessions as _rt_sessions
 
 
 class _FakeSessionDB:
@@ -48,7 +49,7 @@ class _FakeSessionDB:
                 "source": "cli",
                 "model": "claude",
                 "started_at": 100,
-                "last_active": 101,
+                "last_active": 150,
             }
         ]
         return [
@@ -115,7 +116,7 @@ def test_desktop_session_search_merges_id_matches_before_content_matches(monkeyp
     _FakeSessionDB.requested_fields = None
     monkeypatch.setattr("hermes_state.SessionDB", _FakeSessionDB)
 
-    response = asyncio.run(web_server.search_sessions(q="20260603", limit=2))
+    response = asyncio.run(_rt_sessions.search_sessions(q="20260603", limit=2))
 
     assert _FakeSessionDB.requested_fields is not None
     assert "context" not in _FakeSessionDB.requested_fields
@@ -126,6 +127,8 @@ def test_desktop_session_search_merges_id_matches_before_content_matches(monkeyp
         "results": [
             {
                 "id": "20260603_090200_exact",
+                "profile": "default",
+                "is_default_profile": True,
                 "session_id": "20260603_090200_exact",
                 "lineage_root": "20260603_090200_exact",
                 "snippet": "ID match preview",
@@ -133,10 +136,14 @@ def test_desktop_session_search_merges_id_matches_before_content_matches(monkeyp
                 "source": "cli",
                 "model": "claude",
                 "session_started": 100,
-                "match_timestamp": 101,
+                "match_timestamp": 150,
+                # Row recency rides on id-match rows (sessions table)...
+                "last_active": 150,
             },
             {
                 "id": "content_session",
+                "profile": "default",
+                "is_default_profile": True,
                 "session_id": "content_session",
                 "lineage_root": "content_session",
                 "snippet": "content hit",
@@ -145,35 +152,56 @@ def test_desktop_session_search_merges_id_matches_before_content_matches(monkeyp
                 "model": "gpt",
                 "session_started": 200,
                 "match_timestamp": 201,
+                # ...while FTS hits have none and leave it null.
+                "last_active": None,
             },
         ],
-        "has_more": False,
-        "next_offset": 2,
-    }
+        "has_more": False, "next_offset": 2}
     assert _FakeSessionDB.opened_read_only is True
 
 
-def test_desktop_session_search_paginates_deduplicated_results(monkeypatch):
+def test_desktop_session_search_stamps_the_requested_profile(monkeypatch):
+    monkeypatch.setattr(
+        _rt_sessions, "_cron_profile_home", lambda profile: (profile, None)
+    )
+    monkeypatch.setattr(
+        _rt_sessions,
+        "_open_session_db_for_profile",
+        lambda profile, *, read_only: _FakeSessionDB(read_only=read_only),
+    )
+
+    response = asyncio.run(
+        _rt_sessions.search_sessions(q="20260603", limit=2, profile="worker")
+    )
+
+    assert {
+        (row["profile"], row["is_default_profile"])
+        for row in response["results"]
+    } == {("worker", False)}
+
+
+def test_mobile_history_projection_preserves_model_content_but_hides_artifact_path():
+    message = {
+        "role": "assistant",
+        "content": "reply MEDIA:/private/artifact.png",
+        "display_metadata": {"display_text": "reply", "attachments": []},
+    }
+    projected = _rt_sessions._project_for_display([message], source="ios-pocket")
+    assert projected[0]["content"] == "reply"
+    assert projected[0]["display_metadata"]["attachments"] == []
+    assert message["content"] == "reply MEDIA:/private/artifact.png"
+
+
+def test_search_pages_lineage_results(monkeypatch):
     class PagingDB(_FakeSessionDB):
         def search_sessions_by_id(self, *args, **kwargs):
             return []
-
         def search_messages(self, *args, **kwargs):
-            return [
-                {
-                    "session_id": f"session-{index}",
-                    "snippet": f"hit {index}",
-                    "role": "user",
-                    "source": "cli",
-                    "model": "test",
-                    "session_started": index,
-                }
-                for index in range(3)
-            ]
-
+            return [{"session_id": f"session-{i}", "snippet": f"hit {i}",
+                     "role": "user", "source": "cli", "model": "test",
+                     "session_started": i, "timestamp": i} for i in range(3)]
     monkeypatch.setattr("hermes_state.SessionDB", PagingDB)
-    response = asyncio.run(web_server.search_sessions(q="needle", limit=1, offset=1))
-
+    response = asyncio.run(_rt_sessions.search_sessions(q="needle", limit=1, offset=1))
     assert [row["session_id"] for row in response["results"]] == ["session-1"]
     assert response["has_more"] is True
     assert response["next_offset"] == 2

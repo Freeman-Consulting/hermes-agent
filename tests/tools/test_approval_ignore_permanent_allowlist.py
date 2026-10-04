@@ -48,7 +48,8 @@ def test_flag_is_context_isolated(monkeypatch):
 
 def test_check_dangerous_command_prompts_when_ignoring(monkeypatch):
     _with_allowlist(monkeypatch, {"recursive delete"})
-    monkeypatch.setattr(ap, "_get_approval_mode", lambda: "manual")
+    import tools.approval_context as approval_context
+    monkeypatch.setattr(approval_context, "_get_approval_mode", lambda: "manual")
     asked = []
 
     def cb(command, description, **kw):

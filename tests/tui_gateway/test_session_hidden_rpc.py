@@ -11,6 +11,8 @@ Covers the two seams Bot Mode's "sessions are always hidden" policy leans on:
   every default caller keeps the hidden rows dropped.
 """
 
+import json
+
 import pytest
 
 import tui_gateway.server as srv
@@ -59,6 +61,8 @@ def test_set_hidden_unknown_id_still_errors(db):
     assert envelope.get("error"), envelope
 
 
+
+
 def test_session_list_include_hidden(db):
     _seed(db, "plain-chat")
     _seed(db, "bot-chat")
@@ -70,6 +74,33 @@ def test_session_list_include_hidden(db):
     all_rows = _call("session.list", {"include_hidden": True})["result"]["sessions"]
     assert {s["id"] for s in all_rows} == {"plain-chat", "bot-chat"}
 
+
+def test_mobile_artifact_display_metadata_merges_without_changing_content(db):
+    _seed(db, "artifact-chat")
+    db.append_message("artifact-chat", "assistant", "plain model response",
+                      display_metadata={"reaction": "star"})
+    assert db.merge_latest_message_display_metadata(
+        "artifact-chat", role="assistant", display_metadata={"attachments": []}
+    )
+    row = db._conn.execute(
+        "SELECT content, display_metadata FROM messages WHERE session_id = ? ORDER BY id DESC LIMIT 1",
+        ("artifact-chat",),
+    ).fetchone()
+    assert row[0] == "plain model response"
+    assert json.loads(row[1]) == {"reaction": "star", "attachments": []}
+
+
+@pytest.mark.parametrize("source", ["oneshot", "kanban", "tool"])
+def test_session_list_hides_internal_sources(db, source):
+    """Finite one-shot runs (`hermes -z`, `chat -q`) and other non-conversation rows never reach the
+    human picker; interactive rows stay (#112550)."""
+    _seed(db, "plain-chat")
+    db.create_session("internal-run", source=source)
+    db._conn.execute("UPDATE sessions SET message_count = 1 WHERE id = ?", ("internal-run",))
+    db._conn.commit()
+
+    rows = _call("session.list", {})["result"]["sessions"]
+    assert {s["id"] for s in rows} == {"plain-chat"}
 
 def test_session_list_projects_authoritative_recency_and_list_flags(db):
     _seed(db, "mobile-chat")

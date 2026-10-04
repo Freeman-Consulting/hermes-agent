@@ -46,6 +46,7 @@ _tickets: Dict[str, Tuple[int, Dict[str, Any]]] = {}  # ticket -> (expires_at, i
 # Short-lived tombstones distinguish a genuine replay from an arbitrary
 # unknown ticket without retaining the ticket indefinitely.
 _consumed_tickets: Dict[str, int] = {}  # ticket -> tombstone expiry
+_internal_credential: Optional[str] = None  # process-lifetime, guarded by _lock
 
 #: The process-lifetime internal credential (see module docstring). Lazily
 #: minted on first ``internal_ws_credential()`` call and stable for the life
@@ -66,7 +67,7 @@ class TicketInvalid(Exception):
         self.reason_code = reason_code
 
 
-def mint_ticket(*, user_id: str, provider: str, audience: Optional[str] = None) -> str:
+def mint_ticket(*, user_id: str, provider: str, audience: Optional[str] = None, extra: Optional[Dict[str, Any]] = None) -> str:
     """Generate a one-shot ticket bound to this user identity.
 
     The returned token is base64url, 43 bytes of entropy (32-byte random
@@ -84,6 +85,10 @@ def mint_ticket(*, user_id: str, provider: str, audience: Optional[str] = None) 
         "provider": provider,
         "minted_at": int(time.time()),
     }
+    if extra:
+        info.update(extra)
+    # Caller-supplied extra must not override the identity or audience.
+    info.update(user_id=user_id, provider=provider)
     if audience:
         info["audience"] = audience
     with _lock:

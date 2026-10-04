@@ -33,4 +33,6 @@ def test_anthropic_setup_picker_includes_model_switch_catalog(monkeypatch):
     switch_models = next(row["models"] for row in rows if row["slug"] == "anthropic")
     assert "claude-opus-5-5" in switch_models
     assert set(switch_models) <= set(captured["models"])
-    assert captured["models"][:len(_PROVIDER_MODELS["anthropic"])] == _PROVIDER_MODELS["anthropic"]
+    # Upstream puts newly discovered agentic models first; only catalog parity
+    # matters, not preserving the older hard-coded list's ordering.
+    assert set(_PROVIDER_MODELS["anthropic"]) <= set(captured["models"])

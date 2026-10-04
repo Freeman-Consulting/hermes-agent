@@ -16,6 +16,7 @@ import enum
 import json
 import logging
 import os
+import os
 import threading
 from pathlib import Path
 from typing import Any
@@ -163,3 +164,7 @@ def ticket_fingerprint(ticket: str) -> str:
     """
     import hashlib
     return hashlib.sha256(ticket.encode("utf-8")).hexdigest()[:16]
+
+# ---- BEGIN PLUGIN-COMPAT (revert-scheduled; see COMPAT_MANIFEST.md) ----
+# External plugins imported os from this module before decomposition.
+# ---- END PLUGIN-COMPAT ----
