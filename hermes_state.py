@@ -26,7 +26,6 @@ import queue
 import random
 import re
 import sqlite3
-import struct
 import sys
 import threading
 import time
@@ -4190,9 +4189,8 @@ class StateDbReplacedError(RuntimeError):
     """
 
 
-# SQLite header: 4-byte big-endian application_id at offset 68. Distinct from
-# inode: ``cp`` onto the same path keeps st_ino and truncates+rewrites.
-_STATE_DB_APPLICATION_ID_OFFSET = 68
+# SQLite's application_id is distinct from the inode: ``cp`` onto the same
+# path keeps st_ino and truncates+rewrites.
 _STATE_DB_GENERATION_KEY = "db_file_generation"
 _STATE_DB_REPLACED_MSG = (
     "FATAL: state.db was replaced underneath the gateway; refusing further "
@@ -4225,22 +4223,23 @@ def divert_session_transcript_jsonl(session_id: str, messages) -> "Optional[Path
 
 
 def _read_sqlite_application_id(db_path: Path) -> "Optional[int]":
-    """Read application_id from the SQLite header without opening a connection."""
+    """Read the on-disk generation through SQLite's own descriptor handling.
+
+    A raw file open/close would cancel this process's POSIX SQLite locks,
+    including locks owned by other connections or threads. A fresh immutable
+    SQLite connection reads the main-file header (not an old WAL or pager
+    cache), while SQLite defers descriptor closure if another connection on
+    the same inode holds locks. This preserves same-inode replacement checks.
+    """
     try:
-        with db_path.open("rb") as handle:
-            header = handle.read(_STATE_DB_APPLICATION_ID_OFFSET + 4)
-    except OSError:
+        uri = db_path.resolve().as_uri() + "?mode=ro&immutable=1"
+        with contextlib.closing(
+            _connect_tracked_db(uri, tracking_path=db_path, uri=True)
+        ) as conn:
+            row = conn.execute("PRAGMA application_id").fetchone()
+        return (int(row[0]) & 0xFFFFFFFF) if row else None
+    except (OSError, sqlite3.Error):
         return None
-    if len(header) < _STATE_DB_APPLICATION_ID_OFFSET + 4:
-        return None
-    if header[:16] != b"SQLite format 3\x00":
-        return None
-    return int(
-        struct.unpack(
-            ">I",
-            header[_STATE_DB_APPLICATION_ID_OFFSET:_STATE_DB_APPLICATION_ID_OFFSET + 4],
-        )[0]
-    )
 
 
 def _stat_db_file_identity(path: Path) -> "Optional[tuple]":

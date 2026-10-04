@@ -71,6 +71,36 @@ def _make_db(path, journal_mode: str) -> None:
     conn.close()
 
 
+def _assert_generation_probe_preserves_lock(tmp_path):
+    from pathlib import Path
+    from hermes_state import _read_sqlite_application_id
+    from hermes_cli.sqlite_safe_read import connect_tracked
+
+    db = tmp_path / 'generation.db'
+    _make_db(db, 'DELETE')
+    conn = connect_tracked(db, isolation_level=None)
+    try:
+        conn.execute('PRAGMA application_id=12345')
+        conn.execute('BEGIN IMMEDIATE')
+        assert not _external_writer_can_break_in(db)
+        assert _read_sqlite_application_id(Path(db)) == 12345
+        assert conn.in_transaction
+        assert not _external_writer_can_break_in(db)
+    finally:
+        conn.rollback()
+        conn.close()
+
+
+@pytest.mark.macos_only
+def test_generation_probe_preserves_posix_locks_macos(tmp_path):
+    _assert_generation_probe_preserves_lock(tmp_path)
+
+
+@pytest.mark.linux_only
+def test_generation_probe_preserves_posix_locks_linux(tmp_path):
+    _assert_generation_probe_preserves_lock(tmp_path)
+
+
 @pytest.fixture
 def clean_registry():
     yield
