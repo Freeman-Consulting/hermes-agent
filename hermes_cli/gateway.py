@@ -1799,6 +1799,18 @@ def _reaper_exclusion_pids(extra_exclude: set | None) -> set[int]:
         # profile's launchd gateway is misclassified as an unsupervised orphan and reaped. Same class as the
         # update-sweep fix in #74075.
         own |= _get_service_pids(all_profiles=True)
+    # Service PIDs name the SUPERVISED process, which on macOS is the ``hermes_cli.stderr_timestamp``
+    # wrapper the launchd plist execs (gateway_launchd.py) — the real ``gateway run`` is its CHILD.
+    # Excluding only the wrapper left the child as the reaper's sole candidate, so any Desktop-owned
+    # backend started from another HERMES_HOME (tests, the Desktop pool) SIGTERM'd the live launchd
+    # gateway and launchd respawned it. Exempt the whole descendant tree of every service PID.
+    with contextlib.suppress(Exception):
+        import psutil  # type: ignore
+        for service_pid in list(own):
+            if service_pid <= 1:
+                continue
+            with contextlib.suppress(Exception):
+                own.update(child.pid for child in psutil.Process(service_pid).children(recursive=True))
     # Exempt the recorded gateway PID and its parent chain (on Windows the Scheduled-Task bootstrap's
     # ``gateway run`` argv matches the scan; killing it takes the gateway down). Use the RAW pidfile +
     # lock records, not only the validated probe: get_running_pid returns None on any validation
