@@ -69,8 +69,12 @@ def coerce_tool_args(tool_name: str, args: Dict[str, Any]) -> Dict[str, Any]:
             if (expected == "array" and is_container) or (expected == "object" and isinstance(value, dict)):
                 args[key] = _normalize_json_strings_for_schema(value, prop_schema)
             continue
-        if not expected and not _schema_allows_null(prop_schema):
-            continue
+        if not expected:
+            # Typeless union (anyOf/oneOf, e.g. terminal.notify: boolean | string[]).
+            # Models stringify these ("true", '["pat"]'); try each branch's kind in turn.
+            expected = _union_branch_types(prop_schema)
+            if not expected and not _schema_allows_null(prop_schema):
+                continue
         coerced = _coerce_value(value, expected, schema=prop_schema)
         if coerced is not value:
             args[key] = coerced
@@ -78,6 +82,26 @@ def coerce_tool_args(tool_name: str, args: Dict[str, Any]) -> Dict[str, Any]:
                 args[key] = _normalize_json_strings_for_schema(coerced, prop_schema)
 
     return args
+
+
+def _union_branch_types(schema: Any) -> list[str]:
+    """Non-string JSON types offered by a typeless anyOf/oneOf, in declaration order.
+
+    ``string`` branches are excluded: if a union accepts a string, the model's
+    string value is already valid and must not be reinterpreted.
+    """
+    if not isinstance(schema, dict) or schema.get("type"):
+        return []
+    kinds: list[str] = []
+    for union_key in ("anyOf", "oneOf"):
+        for branch in schema.get(union_key) or []:
+            t = branch.get("type") if isinstance(branch, dict) else None
+            for k in (t if isinstance(t, list) else [t]):
+                if k == "string":
+                    return []
+                if isinstance(k, str) and k != "null" and k not in kinds:
+                    kinds.append(k)
+    return kinds
 
 
 def _schema_accepts_kind(schema: Any, kind: str) -> bool:

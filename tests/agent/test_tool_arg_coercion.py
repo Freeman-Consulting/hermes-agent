@@ -247,3 +247,38 @@ class TestCoerceToolArgsNested:
         args = {"todos": [_json.dumps({"id": "1", "content": "x", "status": "pending"})]}
         result = coerce_tool_args("todo_list", args)
         assert result["todos"][0] == {"id": "1", "content": "x", "status": "pending"}
+
+
+class TestTypelessUnionCoercion:
+    """anyOf/oneOf properties with no top-level ``type`` (terminal.notify: boolean | string[]).
+
+    Local models stringify these values; before this, coercion skipped typeless
+    unions and the terminal handler rejected ``notify: "true"`` outright.
+    """
+
+    def test_real_terminal_notify_bool_string(self):
+        for raw, want in (("true", True), ("True", True), ("false", False)):
+            out = coerce_tool_args("terminal", {"command": "x", "background": True, "notify": raw})
+            assert out["notify"] is want
+
+    def test_real_terminal_notify_json_array_string(self):
+        out = coerce_tool_args("terminal", {"command": "x", "background": True, "notify": '["ready", "npm error"]'})
+        assert out["notify"] == ["ready", "npm error"]
+
+    def test_real_terminal_notify_unparseable_string_kept(self):
+        out = coerce_tool_args("terminal", {"command": "x", "background": True, "notify": "whenever"})
+        assert out["notify"] == "whenever"
+
+    def test_union_with_string_branch_is_not_reinterpreted(self):
+        schema = {"name": "t", "parameters": {"type": "object", "properties": {
+            "v": {"anyOf": [{"type": "string"}, {"type": "boolean"}]}}}}
+        with patch("tools.arg_coercion.registry.get_schema", return_value=schema):
+            assert coerce_tool_args("t", {"v": "true"})["v"] == "true"
+
+    def test_coerced_notify_dispatches_through_terminal_handler(self):
+        """End-to-end through the registry: the stringified call no longer errors on notify."""
+        import json
+        from tools.registry import registry
+        raw = registry.dispatch("terminal", coerce_tool_args("terminal", {
+            "command": "true", "background": True, "notify": "true"}), task_id="t-union")
+        assert "notify must be" not in (json.loads(raw).get("error") or "")
