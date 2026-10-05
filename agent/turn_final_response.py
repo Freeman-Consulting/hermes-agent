@@ -92,6 +92,17 @@ def finish_text_response(
         and (_content is None or (isinstance(_content, str) and not _content.strip()))
     ):
         _promoted = agent._extract_reasoning(assistant_message) or None
+        # Right after a tool result, a reasoning-only stop is usually a stalled plan ("a single
+        # poll should be fine…") rather than an answer the parser filed as reasoning; phrasing
+        # varies too much for the tail detector alone. Defer to the post-tool empty nudge once;
+        # if the model stops reasoning-only again, promotion below still ends the turn.
+        _after_tool = bool(messages) and isinstance(messages[-1], dict) and messages[-1].get("role") == "tool"
+        if _promoted and _after_tool and not getattr(agent, "_post_tool_empty_retried", False):
+            logger.info(
+                "Reasoning-only stop right after a tool result (%d chars) — nudging once before "
+                "promoting (model=%s)", len(_promoted), agent.model,
+            )
+            _promoted = None
         if _promoted:
             # WARNING, not INFO: a model that keeps ending turns this way is stalled
             # (planning monologue, zero tool calls) while the turn reports "complete".

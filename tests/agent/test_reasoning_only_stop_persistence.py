@@ -175,3 +175,49 @@ def test_genuine_reasoning_only_answer_with_tools_still_promotes_on_first_call(l
         ])
         assert result["api_calls"] == 1
         assert result["final_response"] == answer
+
+
+# ── reasoning-only stop right after a tool result: nudge once before promoting ─────────────────
+
+def _tool_round(_mock_tool_call, _mock_response):
+    tc = _mock_tool_call(name="terminal", arguments='{"command": "./slow_build.sh", "background": true}', call_id="c1")
+    return _mock_response(content="", finish_reason="tool_calls", tool_calls=[tc])
+
+
+# Verbatim Flash-Next tail (HermesBench t12/t01, 2026-10-05): no first-person plan marker, so the
+# tail detector cannot see it; only the post-tool position marks it as a stall.
+POST_TOOL_STALL = ("Check whether it's actually running (not in an immediately-terminated state). "
+                   "The instructions say not to use blind sleep loops, but a simple single poll should be fine.")
+
+
+def test_reasoning_only_stop_after_tool_result_is_nudged_not_returned(loop_agent):
+    from tests.agent.test_run_agent import _mock_response, _mock_tool_call
+
+    loop_agent.valid_tool_names = {"terminal"}
+    with patch("model_tools.handle_function_call", return_value='{"output": "Background process started"}'):
+        result = _run(loop_agent, [
+            _tool_round(_mock_tool_call, _mock_response),
+            _mock_response(content="", finish_reason="stop", reasoning_content=POST_TOOL_STALL),
+            _mock_response(content="It is running in the background; you'll be notified when it exits.", finish_reason="stop"),
+        ])
+
+    assert result["api_calls"] == 3
+    assert result["final_response"].startswith("It is running in the background")
+
+
+def test_reasoning_only_after_tool_result_still_promotes_when_the_nudge_is_ignored(loop_agent):
+    """Bounded: one nudge, then the parser-compat promotion ends the turn."""
+    from tests.agent.test_run_agent import _mock_response, _mock_tool_call
+
+    answer = "The build is running in the background and you'll be notified on exit."
+    loop_agent.valid_tool_names = {"terminal"}
+    with patch("model_tools.handle_function_call", return_value='{"output": "Background process started"}'):
+        result = _run(loop_agent, [
+            _tool_round(_mock_tool_call, _mock_response),
+            _mock_response(content="", finish_reason="stop", reasoning_content=answer),
+            _mock_response(content="", finish_reason="stop", reasoning_content=answer),
+            _mock_response(content="NEVER REACHED", finish_reason="stop"),
+        ])
+
+    assert result["api_calls"] == 3
+    assert result["final_response"] == answer
