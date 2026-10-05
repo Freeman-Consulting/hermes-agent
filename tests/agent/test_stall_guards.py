@@ -520,3 +520,17 @@ def test_promoted_reasoning_detector_catches_self_directed_imperative_plans():
         "It is running in the background; you will be notified when it exits.",
     ):
         assert not promoted_reasoning_announces_action(answer), answer
+
+
+def test_promoted_reasoning_detector_sees_plan_after_self_correction_marker():
+    """Verbatim Flash-Next tail (HermesBench t12/t01): the model talks itself out of an answer
+    with "—actually, let me poll…" and stops reasoning-only. The marker must not hide the plan."""
+    from agent.agent_runtime_helpers import promoted_reasoning_announces_action
+
+    tail = ("I could do a quick poll to confirm it's running, but that's probably unnecessary"
+            "\u2014actually, let me quickly poll to check whether it started normally.\n")
+    assert promoted_reasoning_announces_action(tail)
+    assert promoted_reasoning_announces_action("Okay, let me read the file.")
+    for text in ("Actually, the answer is 42.", "OK, it is running.",
+                 "Actually, let me check. The answer is 42."):
+        assert not promoted_reasoning_announces_action(text), text

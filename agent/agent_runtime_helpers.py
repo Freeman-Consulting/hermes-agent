@@ -3144,6 +3144,9 @@ def trailing_continue_intent(text: str) -> bool:
 # {start,try,check,fix,send,do,look,run,fire}.
 _PROMOTED_REASONING_PLAN_TAIL_RE = re.compile(
     r"(?:^|[.!?:\u3002\uff01\uff1f\u2014\u2013\n]\s*|\u2026\s*)"
+    # A self-correcting discourse marker ("…unnecessary—actually, let me poll") may sit between
+    # the boundary and the plan; without this the reversal tail reads as a stated answer.
+    r"(?:(?:actually|ok(?:ay)?|so|well|wait|hmm|alright|fine)[,!]?\s+)?"
     r"(?:let(?:['\u2019]s| me)\b|i(?:['\u2019]ll| will| need to| should| am going to|['\u2019]m going to)\b"
     r"|next[,:]? i\b|now i(?:['\u2019]ll| will| need to)\b|first[,:]? i(?:['\u2019]ll| will| need to)\b"
     r"|\u0e08\u0e30\u0e43\u0e2b\u0e49\u0e1c\u0e21|\u0e1c\u0e21\u0e08\u0e30"
