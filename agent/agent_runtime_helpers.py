@@ -3149,8 +3149,15 @@ _PROMOTED_REASONING_PLAN_TAIL_RE = re.compile(
     r"|\u0e08\u0e30\u0e43\u0e2b\u0e49\u0e1c\u0e21|\u0e1c\u0e21\u0e08\u0e30"
     r"|\u0e15\u0e48\u0e2d\u0e44\u0e1b(?:\u0e08\u0e30|\u0e1c\u0e21\u0e08\u0e30)"
     r"|\u0e02\u0e2d(?:\u0e40\u0e23\u0e34\u0e48\u0e21|\u0e25\u0e2d\u0e07|\u0e15\u0e23\u0e27\u0e08|\u0e41\u0e01\u0e49|\u0e2a\u0e48\u0e07|\u0e17\u0e33|\u0e14\u0e39)"
-    r"|\u0e08\u0e30(?:\u0e40\u0e23\u0e34\u0e48\u0e21|\u0e25\u0e2d\u0e07|\u0e15\u0e23\u0e27\u0e08|\u0e41\u0e01\u0e49|\u0e2a\u0e48\u0e07|\u0e17\u0e33|\u0e14\u0e39|\u0e23\u0e31\u0e19|\u0e22\u0e34\u0e07))"
-    r"[^.!?\n\u3002\uff01\uff1f]{0,160}(?:[.:\u2026]+)?\s*$",
+    r"|\u0e08\u0e30(?:\u0e40\u0e23\u0e34\u0e48\u0e21|\u0e25\u0e2d\u0e07|\u0e15\u0e23\u0e27\u0e08|\u0e41\u0e01\u0e49|\u0e2a\u0e48\u0e07|\u0e17\u0e33|\u0e14\u0e39|\u0e23\u0e31\u0e19|\u0e22\u0e34\u0e07)"
+    # Self-directed imperative plan with a purpose/sequence marker ("Do a simple poll to make
+    # sure it started.", "Check the log first."): reasoning addresses the model itself, so a
+    # bare imperative tail is a plan. The marker keeps advice-shaped answers ("Run tests.") out.
+    r"|(?:quickly |now |then |next,? |first,? )?(?:do|check|verify|poll|run|read|look|confirm|inspect|test|try|search|open|fetch|call)\b"
+    r"(?=(?:[^.!?\n\u3002\uff01\uff1f]|\.(?=\w))*\b(?:to make sure|to confirm|to verify|to see|to check|first|next|now|again)\b))"
+    # A '.' only ends a sentence when NOT followed by a word char: "llama.cpp", "v0.31.0" and
+    # "config.yaml" inside a plan sentence must not hide its tail from the detector.
+    r"(?:[^.!?\n\u3002\uff01\uff1f]|\.(?=\w)){0,160}(?:[.:\u2026]+)?\s*$",
     re.IGNORECASE,
 )
 

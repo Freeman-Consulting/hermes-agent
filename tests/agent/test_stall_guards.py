@@ -485,3 +485,38 @@ def test_promoted_reasoning_detector_ignores_thai_stated_answers():
         "พรุ่งนี้จะฝนตกทั่วประเทศ",  # "tomorrow it will rain" — not a first-person action verb
     ):
         assert not promoted_reasoning_announces_action(text), text
+
+
+def test_promoted_reasoning_detector_sees_past_dotted_names():
+    """A '.' inside a token (llama.cpp, v0.31.0, config.yaml) is not a sentence end; it used to
+    hide the plan tail of a real Flash-Next cron stall (R&D brief, 2026-10-05)."""
+    from agent.agent_runtime_helpers import promoted_reasoning_announces_action
+
+    tail = ("I need to run the x_search queries, then focus on the vLLM v0.31.0 release since there's a "
+            "gap from our current v0.27.0 version. I should verify the release notes are sufficient and "
+            "check the llama.cpp latest build information.")
+    assert promoted_reasoning_announces_action(tail)
+    assert promoted_reasoning_announces_action("Now I need to read config.yaml and the .env file.")
+    for answer in ("Use llama.cpp for this. It is faster.", "The build uses v0.31.0 and passes."):
+        assert not promoted_reasoning_announces_action(answer), answer
+
+
+def test_promoted_reasoning_detector_catches_self_directed_imperative_plans():
+    """Reasoning talks to the model itself: 'Do a simple poll to make sure it started.' is a plan
+    (verbatim Flash-Next tail after a background start, t12 HermesBench). A purpose/sequence marker
+    is required so advice-shaped answers ('Run tests.') still promote."""
+    from agent.agent_runtime_helpers import promoted_reasoning_announces_action
+
+    for plan in (
+        "Quickly check whether it's actually running? Do a simple poll to make sure it started without any errors.\n",
+        "Check the log first.",
+        "Read config.yaml to confirm the port.",
+    ):
+        assert promoted_reasoning_announces_action(plan), plan
+    for answer in (
+        "Run tests.",
+        "Check passed: all 12 tasks green.",
+        "Do not worry, it is fine.",
+        "It is running in the background; you will be notified when it exits.",
+    ):
+        assert not promoted_reasoning_announces_action(answer), answer
