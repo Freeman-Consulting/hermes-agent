@@ -71,6 +71,51 @@ def _acp_approval_timeout() -> float:
         return base
 
 
+def _acp_config() -> dict:
+    from hermes_cli.config import load_config_readonly
+
+    try:
+        cfg = load_config_readonly().get("acp") or {}
+    except Exception:
+        logger.debug("ACP config unavailable", exc_info=True)
+        return {}
+    return cfg if isinstance(cfg, dict) else {}
+
+
+def _acp_command_approvals_off() -> bool:
+    """``acp.approval_mode: off`` bypasses command approval prompts for editor sessions only.
+
+    Anything else (absent, ``manual``, ``smart``) inherits ``approvals.mode``. YAML 1.1 reads a
+    bare ``off`` as False, so that is honoured too. Hardline blocks still run first."""
+    raw = _acp_config().get("approval_mode")
+    if raw is False:
+        return True
+    return isinstance(raw, str) and raw.strip().lower() == "off"
+
+
+# ACP session ids for which this adapter turned on session-scoped approval bypass.
+_ACP_BYPASS_SESSIONS: set[str] = set()
+
+
+def _sync_acp_command_bypass(session_id: str) -> None:
+    """Apply ``acp.approval_mode`` to one ACP session before a turn.
+
+    Read per turn so a config edit takes effect on the next prompt; only toggles on change so
+    permission-mode dependents are not released every turn."""
+    from tools.approval import disable_session_yolo, enable_session_yolo, is_session_yolo_enabled
+
+    want = _acp_command_approvals_off()
+    if want and not is_session_yolo_enabled(session_id):
+        # Re-check live state, not just our set: clear_session() drops the bypass on teardown.
+        enable_session_yolo(session_id)
+        _ACP_BYPASS_SESSIONS.add(session_id)
+        logger.info("Session %s: ACP command approvals off (acp.approval_mode)", session_id)
+    elif not want and session_id in _ACP_BYPASS_SESSIONS:
+        disable_session_yolo(session_id)
+        _ACP_BYPASS_SESSIONS.discard(session_id)
+        logger.info("Session %s: ACP command approvals restored", session_id)
+
+
 def _acp_model_allowlist() -> list[str]:
     """Model-choice ids or globs from ``acp.models``; absent means all models."""
     try:
@@ -337,19 +382,26 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
         loop = asyncio.get_running_loop()
         loop.call_soon(asyncio.create_task, make_coro())
 
+    def _default_mode(self) -> str:
+        """``acp.default_mode`` seeds sessions the editor has not switched; unknown -> Default."""
+        raw = str(_acp_config().get("default_mode") or "").strip()
+        return raw if raw in self._MODES else self._MODE_DEFAULT
+
+    def _current_mode(self, state: SessionState) -> str:
+        current = str(getattr(state, "mode", "") or self._default_mode())
+        return current if current in self._MODES else self._MODE_DEFAULT
+
     def _session_modes(self, state: SessionState) -> SessionModeState:
         """Edit-approval policy as ACP modes. Zed renders ``config_options`` in the model
         picker's slot; modes (as Claude/Codex use) coexist with the picker."""
-        current = str(getattr(state, "mode", "") or self._MODE_DEFAULT)
-        if current not in self._MODES:
-            current = self._MODE_DEFAULT
+        current = self._current_mode(state)
         return SessionModeState(
             current_mode_id=current,
             available_modes=[SessionMode(id=m, name=n, description=d) for m, (_p, n, d) in self._MODES.items()],
         )
 
     def _edit_approval_policy_for_state(self, state: SessionState) -> tuple[str, str | None]:
-        mode = str(getattr(state, "mode", "") or self._MODE_DEFAULT)
+        mode = self._current_mode(state)
         policy = self._MODE_TO_EDIT_APPROVAL_POLICY.get(mode, self._EDIT_APPROVAL_POLICY_DEFAULT)
         return policy, state.cwd
 
@@ -845,6 +897,7 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
                 return lambda: reset_edit_approval_requester(token)
 
             _bind_guarded(stack, "session context", _session_context)
+            _sync_acp_command_bypass(session_id)
             if approval_cb:
                 _bind_guarded(stack, "approval callback", _approval)
             if edit_approval_requester:

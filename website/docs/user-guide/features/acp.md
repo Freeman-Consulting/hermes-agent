@@ -373,8 +373,32 @@ options exist on the wire but never reach a human. Buzz Desktop does this, so
 treat that path as unattended execution regardless of your `approvals` setting.
 
 On timeout or error, the approval bridge denies the request. The wait is
-`approvals.timeout` from `config.yaml` (default 300 s), the same knob the CLI and
-gateway prompts use — raise it if your editor keeps approval cards open longer.
+`acp.approval_timeout` when set, else `approvals.timeout` from `config.yaml`
+(default 300 s), the same knob the CLI and gateway prompts use — raise it if your
+editor keeps approval cards open longer.
+
+### Editor-only approval mode
+
+Two `acp:` settings relax approvals for editor sessions without touching the CLI,
+messaging gateway, or cron:
+
+```yaml
+acp:
+  approval_mode: "off"      # off = no command approval prompts in ACP sessions; anything else inherits approvals.mode
+  default_mode: dont_ask    # default | accept_edits | dont_ask — starting edit mode for new ACP sessions
+```
+
+- `approval_mode: "off"` auto-approves dangerous-command prompts for ACP sessions
+  only. Hardline blocks (for example `rm -rf /`, or stopping the gateway from inside
+  itself) still refuse. It is read on every turn, so removing it restores prompts
+  on the next message without restarting the editor. Quote `"off"`; a bare `off` is
+  YAML for `false`, which Hermes also accepts.
+- `default_mode` picks the editor's mode for sessions you have not switched by hand.
+  `dont_ask` auto-allows file edits except sensitive paths (`.env`, SSH keys), which
+  still prompt. Switching the mode in the editor overrides it for that session.
+
+Because this widens what an agent may run unattended, keep it to a machine and
+workspace you trust.
 
 ### Session-scoped edit auto-approval
 
