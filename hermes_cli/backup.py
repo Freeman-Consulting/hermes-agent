@@ -584,6 +584,22 @@ def _zip_sqlite_snapshot(zf: zipfile.ZipFile, abs_path: Path, rel_path: Path, ou
         tmp_db.unlink(missing_ok=True)
 
 
+# Foreign formats other tools store under a ``.db`` name (Xcode ``TestResults/metadata.db`` is an
+# XML or binary plist). Matched by positive magic only, so a damaged SQLite file is never waved
+# through as a plain copy: it still takes the snapshot path and fails loudly.
+_FOREIGN_DB_MAGIC = (b"<?xml", b"bplist")
+
+
+def _has_sqlite_header(path: Path) -> bool:
+    """False only when *path* positively starts with a known non-SQLite format (see above)."""
+    try:
+        with path.open("rb") as f:
+            head = f.read(16)
+    except OSError:
+        return True
+    return not head.startswith(_FOREIGN_DB_MAGIC)
+
+
 def _write_zip_entries(
     zf: zipfile.ZipFile, files_to_add: List[Tuple[Path, Path]], out_path: Path,
     *, on_db_failure, on_error, on_progress, track_bytes: bool) -> int:
@@ -596,7 +612,7 @@ def _write_zip_entries(
     total_bytes = 0
     for i, (abs_path, rel_path) in enumerate(files_to_add, 1):
         try:
-            if abs_path.suffix == ".db":
+            if abs_path.suffix == ".db" and _has_sqlite_header(abs_path):
                 size = _zip_sqlite_snapshot(zf, abs_path, rel_path, out_path)
                 if size is None:
                     on_db_failure(rel_path)
@@ -717,7 +733,7 @@ def _run_backup_locked(args, hermes_root: Path) -> bool:
         logger.info("backup phase=archive status=progress completed=%d total=%d", i, file_count)
 
     with _atomic_output_path(out_path) as archive_path, zipfile.ZipFile(
-            archive_path, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
+            archive_path, "w", zipfile.ZIP_DEFLATED, compresslevel=6, strict_timestamps=False) as zf:
         total_bytes = _write_zip_entries(
             zf, files_to_add, out_path, on_progress=_progress, track_bytes=True,
             on_db_failure=lambda rel: errors.append(f"{rel}: SQLite safe copy failed"),
@@ -1650,7 +1666,7 @@ def _write_full_zip_backup_locked(out_path: Path, hermes_root: Path) -> Optional
     archive_started = time.monotonic()
     try:
         with _atomic_output_path(out_path) as archive_path, zipfile.ZipFile(
-                archive_path, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
+                archive_path, "w", zipfile.ZIP_DEFLATED, compresslevel=6, strict_timestamps=False) as zf:
             _write_zip_entries(
                 zf, files_to_add, out_path, on_db_failure=_db_failure, track_bytes=False,
                 on_error=lambda rel, exc: logger.debug("Skipping %s in zip backup: %s", rel, exc),

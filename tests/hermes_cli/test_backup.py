@@ -792,8 +792,8 @@ class TestBackupEdgeCases:
         assert not (tmp_path / "out.zip").exists()
 
 
-    def test_pre1980_timestamp_skipped(self, tmp_path, monkeypatch):
-        """Backup skips files with pre-1980 timestamps (ZIP limitation)."""
+    def test_pre1980_timestamp_archived_with_clamped_time(self, tmp_path, monkeypatch):
+        """Pre-1980 mtimes (ZIP limitation) are clamped to 1980, not dropped or counted as errors."""
         hermes_home = tmp_path / ".hermes"
         hermes_home.mkdir()
         (hermes_home / "config.yaml").write_text("model: test\n")
@@ -817,8 +817,9 @@ class TestBackupEdgeCases:
         with zipfile.ZipFile(out_zip, "r") as zf:
             names = zf.namelist()
             assert "config.yaml" in names
-            # The pre-1980 file should be skipped, not crash the backup
-            assert "ancient.txt" not in names
+            # The pre-1980 file is kept (clamped timestamp), never silently lost
+            assert zf.read("ancient.txt") == b"old data"
+            assert zf.getinfo("ancient.txt").date_time[0] == 1980
 
 
 
