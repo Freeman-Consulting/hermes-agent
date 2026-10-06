@@ -77,3 +77,46 @@ def test_corrupt_sqlite_still_fails_the_backup(tmp_path, monkeypatch):
 
     from hermes_cli.backup import run_backup
     assert run_backup(Namespace(output=str(tmp_path / "b.zip"))) is False
+
+
+def test_file_deleted_mid_backup_is_skipped_not_an_error(tmp_path, monkeypatch):
+    """A file pruned between scan and write (cron output retention) is gone, not lost."""
+    home = _home(tmp_path, monkeypatch)
+    out_dir = home / "cron" / "output" / "job"
+    out_dir.mkdir(parents=True)
+    keep = out_dir / "keep.md"
+    keep.write_text("keep\n")
+    doomed = out_dir / "doomed.md"
+    doomed.write_text("doomed\n")
+
+    import hermes_cli.backup as b
+    real_iter = b._iter_backup_files
+
+    def scan_then_prune(*a, **kw):
+        files = list(real_iter(*a, **kw))
+        doomed.unlink()
+        return iter(files)
+
+    monkeypatch.setattr(b, "_iter_backup_files", scan_then_prune)
+    out = tmp_path / "b.zip"
+    assert b.run_backup(Namespace(output=str(out))) is True
+    with zipfile.ZipFile(out) as zf:
+        names = zf.namelist()
+    assert "cron/output/job/keep.md" in names
+    assert "cron/output/job/doomed.md" not in names
+
+
+def test_unreadable_file_still_fails_the_backup(tmp_path, monkeypatch):
+    """Only a vanished file is forgiven; a present-but-unreadable file is still data at risk."""
+    home = _home(tmp_path, monkeypatch)
+    f = home / "locked.txt"
+    f.write_text("secret\n")
+    f.chmod(0)
+    try:
+        if os.access(f, os.R_OK):
+            import pytest
+            pytest.skip("running as a user that bypasses file modes")
+        from hermes_cli.backup import run_backup
+        assert run_backup(Namespace(output=str(tmp_path / "b.zip"))) is False
+    finally:
+        f.chmod(0o600)

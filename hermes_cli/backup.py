@@ -602,7 +602,7 @@ def _has_sqlite_header(path: Path) -> bool:
 
 def _write_zip_entries(
     zf: zipfile.ZipFile, files_to_add: List[Tuple[Path, Path]], out_path: Path,
-    *, on_db_failure, on_error, on_progress, track_bytes: bool) -> int:
+    *, on_db_failure, on_error, on_progress, track_bytes: bool, on_vanished=None) -> int:
     """Add every ``(abs_path, rel_path)`` to *zf*, WAL-safe for ``*.db``; return bytes archived.
 
     ``on_db_failure(rel_path)`` runs when a SQLite snapshot fails (may raise to abort);
@@ -622,6 +622,12 @@ def _write_zip_entries(
                 zf.write(abs_path, arcname=str(rel_path))
                 if track_bytes:
                     total_bytes += abs_path.stat().st_size
+        except FileNotFoundError:
+            # Deleted between the scan and the write (cron output pruning, log rotation): the file
+            # no longer exists, so nothing is lost. Not an error; the caller may count it.
+            if on_vanished is not None:
+                on_vanished(rel_path)
+            continue
         except (PermissionError, OSError, ValueError) as exc:
             on_error(rel_path, exc)
             continue
@@ -726,6 +732,7 @@ def _run_backup_locked(args, hermes_root: Path) -> bool:
     logger.info("backup phase=archive status=started files=%d", file_count)
     print(f"Backing up {file_count} files ...")
     errors = []
+    vanished: list[str] = []
     t0 = time.monotonic()
 
     def _progress(i: int) -> None:
@@ -737,7 +744,8 @@ def _run_backup_locked(args, hermes_root: Path) -> bool:
         total_bytes = _write_zip_entries(
             zf, files_to_add, out_path, on_progress=_progress, track_bytes=True,
             on_db_failure=lambda rel: errors.append(f"{rel}: SQLite safe copy failed"),
-            on_error=lambda rel, exc: errors.append(f"{rel}: {exc}"))
+            on_error=lambda rel, exc: errors.append(f"{rel}: {exc}"),
+            on_vanished=lambda rel: vanished.append(str(rel)))
         # External memory-provider state never includes ``.db`` files in practice, so a
         # straight zf.write is fine.
         for abs_path, arcname in external_to_add:
@@ -762,6 +770,8 @@ def _run_backup_locked(args, hermes_root: Path) -> bool:
               "(not portable):\n" + "\n".join(f"    {p}" for p in sorted(skipped_external)[:10]))
     if skipped_dirs:
         print("\n  Excluded directories:\n" + "\n".join(f"    {d}/" for d in sorted(skipped_dirs)))
+    if vanished:
+        print(f"\n  {len(vanished)} file(s) were deleted during the backup and skipped (not an error).")
     if errors:
         _print_capped(f"\n  Archive kept, but {len(errors)} file(s) could not be added:", errors, "  ")
     else:
