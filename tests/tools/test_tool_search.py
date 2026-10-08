@@ -166,6 +166,27 @@ class TestClassification:
         # computer_use IS in the curated defer set → behind the bridge.
         assert "computer_use" not in names
 
+    def test_process_manage_stays_direct_while_terminal_is(self):
+        """terminal's schema tells the model to poll with process_manage(...). Deferred, the
+        model writes that call anyway, the server drops the unoffered name, and the turn ends
+        on a reasoning-only stop (Flash-Next t12/t01). Without terminal it still defers."""
+        from tools.registry import discover_builtin_tools
+        from tools.tool_search import ToolSearchConfig, assemble_tool_defs
+
+        discover_builtin_tools()
+        cfg = ToolSearchConfig.from_raw({"enabled": "on"})
+        with_terminal = assemble_tool_defs(
+            [_td("terminal", "Run a command"), _td("process_manage", "Manage background processes"),
+             _td("computer_use", "Drive the OS")], context_length=200_000, config=cfg)
+        names = {td["function"]["name"] for td in with_terminal.tool_defs}
+        assert {"terminal", "process_manage"} <= names
+        assert "computer_use" not in names
+
+        alone = assemble_tool_defs(
+            [_td("process_manage", "Manage background processes"), _td("computer_use", "Drive the OS")],
+            context_length=200_000, config=cfg)
+        assert "process_manage" not in {td["function"]["name"] for td in alone.tool_defs}
+
 
 
     def test_classify_keeps_unknown_in_visible(self):

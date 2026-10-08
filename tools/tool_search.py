@@ -146,6 +146,12 @@ _DIRECT_SURFACE_TOOLSETS = frozenset({"desktop_ui", "project", "setup"})
 # ask-the-user affordance must be ambient, a stub is not enough.
 _DEFAULT_DEFERRED_TOOLS = frozenset(DEFAULT_CONFIG["tools"]["tool_search"]["defer"])
 
+# Deferred tool -> eager tool whose schema sends the model to it by name ("manage with
+# process_manage(action=poll)"). While the companion is visible the tool stays visible too:
+# deferred, the model writes the call it was told about, the server drops the unoffered name,
+# and the turn ends on a reasoning-only stop.
+_EAGER_COMPANIONS = {"process_manage": "terminal"}
+
 
 def is_deferrable_tool_name(name: str, defer_tools: Optional[frozenset] = None) -> bool:
     """True if a tool is *eligible* for deferral: named in ``defer_tools`` (curated set or
@@ -170,12 +176,18 @@ def _tool_def_names(tool_defs: Iterable[Dict[str, Any]]) -> Iterable[str]:
 def classify_tools(tool_defs: List[Dict[str, Any]], defer_tools: Optional[frozenset] = None,
                    ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     """Split a tool-defs list into (visible, deferrable); bridge tools are dropped (re-added
-    after classification)."""
+    after classification). A deferrable tool whose companion is visible stays visible."""
     visible: List[Dict[str, Any]] = []
     deferrable: List[Dict[str, Any]] = []
     for td, name in zip(tool_defs, _tool_def_names(tool_defs)):
         if name not in BRIDGE_TOOL_NAMES:
             (deferrable if is_deferrable_tool_name(name, defer_tools) else visible).append(td)
+    visible_names = set(_tool_def_names(visible))
+    kept = [td for td, name in zip(deferrable, _tool_def_names(deferrable))
+            if _EAGER_COMPANIONS.get(name) in visible_names]
+    if kept:
+        visible += kept
+        deferrable = [td for td in deferrable if not any(td is k for k in kept)]
     return visible, deferrable
 
 
