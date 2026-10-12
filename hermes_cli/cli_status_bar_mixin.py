@@ -810,6 +810,36 @@ class CLIStatusBarMixin:
                 frames = payload["frames"]
                 self._pet_kitty_pending = frames[self._pet_frame_idx % len(frames)]
 
+    def _terminal_title_marker(self) -> str:
+        """`⚠` waiting on the user, `⏳` busy, `✓` idle — same contract as the Ink TUI title.
+
+        Terminal multiplexers (Herdr, tmux status lines) read the OSC title as the
+        authoritative agent state; screen-scraping the composer misses busy turns
+        once the user types a queued draft over the placeholder."""
+        if (
+            getattr(self, "_approval_state", None)
+            or getattr(self, "_clarify_state", None)
+            or getattr(self, "_sudo_state", None)
+            or getattr(self, "_secret_state", None)
+            or getattr(self, "_slash_confirm_state", None)
+        ):
+            return "⚠"
+        if getattr(self, "_agent_running", False) or getattr(self, "_command_running", False):
+            return "⏳"
+        return "✓"
+
+    def _flush_terminal_title(self, app) -> None:
+        """Emit OSC 2 with the state marker after a render, only when it changed."""
+        title = f"{self._terminal_title_marker()} Hermes"
+        if title == getattr(self, "_terminal_title_last", None):
+            return
+        self._terminal_title_last = title
+        try:
+            app.output.write_raw(f"\x1b]2;{title}\x07")
+            app.output.flush()
+        except (OSError, ValueError):
+            pass
+
     def _pet_flush_kitty_frame(self, app) -> None:
         """Write a queued APC after prompt_toolkit has finished its screen diff."""
         with self._pet_lock:
