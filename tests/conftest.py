@@ -653,6 +653,20 @@ def _isolate_hermes_home(_hermetic_environment):
 
 
 @pytest.fixture(autouse=True)
+def _reset_auxiliary_runtime_main():
+    """Drop the per-turn main-runtime binding a test left behind.
+
+    ``build_turn_context`` calls ``agent.auxiliary_client.set_runtime_main``, which binds a ContextVar
+    and mirrors it into module globals. pytest runs every test in one context, so a test that builds a
+    real turn context without stubbing it makes later auxiliary-client resolution see a phantom main
+    provider (order-dependent failures in ``tests/agent/test_auxiliary_*``).
+    """
+    yield
+    if (aux := sys.modules.get("agent.auxiliary_client")) is not None:
+        aux.clear_runtime_main()
+
+
+@pytest.fixture(autouse=True)
 def _reset_foreground_exit_fence():
     """A test that drives a hard-exit path raises the one-way foreground-spawn fence; lower it after."""
     yield
