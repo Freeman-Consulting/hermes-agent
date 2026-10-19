@@ -4,6 +4,7 @@ protocol negotiation and initial tool discovery. Split from tools/mcp_tool.py.""
 
 import logging
 import asyncio
+import inspect
 import os
 import urllib.parse
 import urllib.request
@@ -111,6 +112,50 @@ def _live_endpoint(server_name: str) -> Optional[tuple[str, dict]]:
     return endpoint.url, headers
 
 
+def _relax_additional_properties(schema):
+    """Copy of *schema* with every ``additionalProperties: false`` removed (recursively).
+
+    An MCP server's OUTPUT schema describes what it returns today; a field it adds tomorrow
+    is not a malformed result. The SDK rejects it client-side AFTER the server acted — for a
+    broker that means a placed order Hermes cannot read back (Robinhood ``agent_initiated``,
+    2026-10-19). Type/required/enum constraints are kept: wrong shapes still fail."""
+    if isinstance(schema, dict):
+        out = {}
+        for k, v in schema.items():
+            if k == "additionalProperties" and v is False:
+                continue
+            out[k] = _relax_additional_properties(v)
+        return out
+    if isinstance(schema, list):
+        return [_relax_additional_properties(v) for v in schema]
+    return schema
+
+
+def _make_lenient_client_session_class(base):
+    """Subclass of the SDK ``ClientSession`` whose output-schema validator is advisory about
+    unknown fields. Built lazily because the SDK is imported late (``_core.ClientSession``)."""
+    class _LenientClientSession(base):
+        def _output_schema_validator(self, name, output_schema):
+            return super()._output_schema_validator(name, _relax_additional_properties(output_schema))
+    _LenientClientSession.__name__ = "LenientClientSession"
+    return _LenientClientSession
+
+
+_LENIENT_SESSION_CACHE: dict = {}
+
+
+def _client_session_class():
+    base = _core.ClientSession
+    cls = _LENIENT_SESSION_CACHE.get(base)
+    if cls is None:
+        if inspect.isclass(base) and hasattr(base, "_output_schema_validator"):
+            cls = _make_lenient_client_session_class(base)
+        else:
+            cls = base  # MagicMock stand-ins (tests) / older SDKs: nothing to relax
+        _LENIENT_SESSION_CACHE[base] = cls
+    return cls
+
+
 class MCPServerTransportMixin:
     """Methods of :class:`tools.mcp_tool.MCPServerTask` (mixed in; relies on its attributes)."""
 
@@ -127,6 +172,10 @@ class MCPServerTransportMixin:
         """
         caps = getattr(self.initialize_result, "capabilities", None)
         return caps is None or getattr(caps, "tools", None) is not None
+
+    @staticmethod
+    def _make_client_session(read_stream, write_stream, **kwargs):
+        return _client_session_class()(read_stream, write_stream, **kwargs)
 
     def _session_kwargs(self) -> dict:
         """ClientSession kwargs: sampling, elicitation, notification + logging callbacks."""
@@ -246,7 +295,7 @@ class MCPServerTransportMixin:
         not unpacked (mcp 1.x yields a 3-tuple, 2.x a pair); a TaskGroup drop maps to ``"reconnect"``."""
         try:
             async with transport_cm as _streams:
-                async with _core.ClientSession(_streams[0], _streams[1], **self._session_kwargs()) as session:
+                async with _client_session_class()(_streams[0], _streams[1], **self._session_kwargs()) as session:
                     return await self._serve_session(session, connect_timeout, label)
         except BaseExceptionGroup as _eg:
             return self._reconnect_or_reraise_group(_eg)
@@ -353,7 +402,7 @@ class MCPServerTransportMixin:
                 if new_pids:
                     self._track_spawned_children(new_pids)
                 self._stdio_child_pids = set(new_pids)  # so in-flight calls fail fast when the child dies
-                async with _core.ClientSession(read_stream, write_stream, **self._session_kwargs()) as session:
+                async with _client_session_class()(read_stream, write_stream, **self._session_kwargs()) as session:
                     # Bound the handshake here (``connect_timeout`` only bounds the caller's ``.result()``):
                     # a server that never answers ``initialize`` would leak child + pipes per retry until EMFILE.
                     connect_timeout = float(config.get("connect_timeout", _core._DEFAULT_CONNECT_TIMEOUT))
