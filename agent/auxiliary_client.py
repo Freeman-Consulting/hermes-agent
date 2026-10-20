@@ -3951,6 +3951,33 @@ def _replan_synchronous_cache_sections(
     )
 
 
+def _fallback_extra_body(
+    task: Optional[str], destination: "_FallbackDestination", effective_extra_body: dict, fallback_entry: dict,
+) -> dict:
+    """Request-body extras that may travel to a fallback destination.
+
+    ``auxiliary.<task>.extra_body`` is written for the task's PRIMARY backend (e.g. vLLM
+    ``chat_template_kwargs``); a strict fallback such as Anthropic Messages 400s on unknown keys,
+    so a dead primary turned into a failed compression. Those task-level keys are dropped when
+    the destination is not the primary provider; the fallback entry's own ``extra_body`` and
+    ``reasoning`` (translated per-provider downstream) still apply."""
+    body = dict(effective_extra_body or {})
+    if not task:
+        return body
+    primary = str(_get_auxiliary_task_config(task).get("provider") or "").strip().lower()
+    if not primary or primary == str(destination.provider or "").strip().lower():
+        return body
+    raw_task_body = _get_auxiliary_task_config(task).get("extra_body")
+    if isinstance(raw_task_body, dict):
+        for key, value in raw_task_body.items():
+            if key != "reasoning" and body.get(key) == value:
+                body.pop(key, None)
+    entry_body = fallback_entry.get("extra_body") if isinstance(fallback_entry, dict) else None
+    if isinstance(entry_body, dict):
+        body.update(entry_body)
+    return body
+
+
 def _fallback_request_kwargs(
     destination: _FallbackDestination, *, task: Optional[str], messages: list,
     tools: Optional[list], temperature: Optional[float], max_tokens: Optional[int],
@@ -3958,7 +3985,8 @@ def _fallback_request_kwargs(
     fallback_entry: dict, task_config: dict, apply_fast_lane: bool,
 ) -> Dict[str, Any]:
     """Build request kwargs for one fallback destination (cache-section replan + fast-lane cap)."""
-    fallback_max_tokens, fallback_extra_body = max_tokens, effective_extra_body
+    fallback_max_tokens, fallback_extra_body = max_tokens, _fallback_extra_body(
+        task, destination, effective_extra_body, fallback_entry)
     if apply_fast_lane:
         fallback_max_tokens, fallback_extra_body = _compression_fast_lane_controls(
             task, actual_provider=destination.provider, actual_model=destination.model,
