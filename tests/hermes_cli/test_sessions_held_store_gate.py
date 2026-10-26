@@ -14,6 +14,7 @@ from argparse import Namespace
 import pytest
 
 from hermes_cli import sessions_cmd
+from tests.hermes_cli._holder_scan_fixture import scan_only_child
 
 pytestmark = pytest.mark.platforms("posix")  # holder scan is unavailable on Windows
 
@@ -43,12 +44,13 @@ def state_db(monkeypatch, tmp_path):
 
 
 @pytest.fixture
-def foreign_holder(state_db):
+def foreign_holder(state_db, monkeypatch):
     proc = subprocess.Popen(
         [sys.executable, "-c", _HOLDER, str(state_db)],
         stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True,
     )
     assert proc.stdout.readline().strip() == "ready"
+    scan_only_child(monkeypatch, proc)
     try:
         yield proc
     finally:

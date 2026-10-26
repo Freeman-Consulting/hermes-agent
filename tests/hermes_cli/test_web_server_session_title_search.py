@@ -1,6 +1,7 @@
 import asyncio
 
-from hermes_cli import web_server
+import hermes_cli.web_routers.sessions as sessions_router
+from hermes_state import SessionDB
 
 
 def test_desktop_search_finds_server_wide_title_match(monkeypatch):
@@ -18,7 +19,8 @@ def test_desktop_search_finds_server_wide_title_match(monkeypatch):
 
         def list_sessions_rich(self, **kwargs):
             assert kwargs["search_query"] == "remote title"
-            assert kwargs["include_hidden"] is False
+            assert kwargs["include_archived"] is True
+            assert kwargs.get("include_hidden", False) is False
             return [{"id": "older-session", "title": "Remote Title", "preview": "Older preview", "source": "tui", "started_at": 100}]
 
         def get_session(self, session_id):
@@ -33,8 +35,10 @@ def test_desktop_search_finds_server_wide_title_match(monkeypatch):
         def close(self):
             pass
 
+    # Browsing requires an owner-initialized store, even with a fake DB projection.
+    SessionDB().close()
     monkeypatch.setattr("hermes_state.SessionDB", MetadataDB)
-    response = asyncio.run(web_server.search_sessions(q="remote title", limit=20))
+    response = asyncio.run(sessions_router.search_sessions(q="remote title", limit=20))
 
     assert MetadataDB.opened_read_only is True
     assert [row["session_id"] for row in response["results"]] == ["older-session"]

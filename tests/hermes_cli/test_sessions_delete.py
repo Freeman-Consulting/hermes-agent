@@ -123,6 +123,10 @@ def _run_prune(monkeypatch, capsys, argv_tail, candidates=None, skipped_open=0, 
             pass
 
     monkeypatch.setattr(hermes_state, "SessionDB", lambda *args, **kwargs: FakeDB())
+    # This test checks CLI filtering, not process-holder discovery. The real
+    # scanner inspects unrelated live processes and conflicts with the suite's
+    # guard against touching the operator's Hermes home.
+    monkeypatch.setattr("hermes_state_holders.foreign_state_db_holders", lambda _path: [])
     monkeypatch.setattr(
         sys, "argv", ["hermes", "sessions", sub, *argv_tail]
     )

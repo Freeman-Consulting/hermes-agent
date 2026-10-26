@@ -204,6 +204,10 @@ def test_search_pages_lineage_results(monkeypatch):
             return [{"session_id": f"session-{i}", "snippet": f"hit {i}",
                      "role": "user", "source": "cli", "model": "test",
                      "session_started": i, "timestamp": i} for i in range(3)]
+    # A browse cannot initialize a missing store; seed the owner's store before
+    # replacing its read-only projection with the fake.
+    from hermes_state import SessionDB
+    SessionDB().close()
     monkeypatch.setattr("hermes_state.SessionDB", PagingDB)
     response = asyncio.run(_rt_sessions.search_sessions(q="needle", limit=1, offset=1))
     assert [row["session_id"] for row in response["results"]] == ["session-1"]

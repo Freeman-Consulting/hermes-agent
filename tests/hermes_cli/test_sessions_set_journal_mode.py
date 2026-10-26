@@ -13,6 +13,7 @@ import pytest
 
 from hermes_cli.sessions_cmd import cmd_sessions
 from hermes_cli.sessions_cmd_journal_mode import _refusal
+from tests.hermes_cli._holder_scan_fixture import scan_only_child
 
 
 def _wal_store(path):
@@ -69,6 +70,7 @@ def test_set_journal_mode_refuses_while_another_process_holds_the_store(
         marker, pid_text = holder.stdout.readline().strip().split(":", 1)
         assert marker == "held"
         sqlite_pid = int(pid_text)
+        scan_only_child(monkeypatch, holder)
         # --force never waives a process the scan actually found.
         assert cmd_sessions(_args("delete", force=force)) == 1
     finally:

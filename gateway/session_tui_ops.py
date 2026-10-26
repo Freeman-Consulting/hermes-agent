@@ -129,7 +129,8 @@ async def session_history(connection, ref, params):
     def read():
         from gateway.session_controls import display_projection
         rows = authority.db.get_messages_as_conversation(target, include_ancestors=True, include_row_ids=True)
-        return {'count': len(rows), 'messages': display_projection(rows, authority.profile_id)}
+        return {'session_id': target, 'count': len(rows),
+                'messages': display_projection(rows, authority.profile_id)}
     return await asyncio.to_thread(read)
 
 

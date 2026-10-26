@@ -23,6 +23,7 @@ async def test_session_history_returns_the_display_transcript_with_row_ids(tmp_p
         reply = await owner.dispatch({'id': 1, 'method': 'session.history',
                                       'params': {'session_id': ref.session_id, 'profile': None}})
         assert 'result' in reply, reply
+        assert reply['result']['session_id'] == target
         messages = reply['result']['messages']
         assert [(m['role'], m['text'], m['row_id']) for m in messages] == [
             ('user', 'first question', first), ('assistant', 'first answer', answer),
@@ -53,6 +54,7 @@ async def test_session_history_of_a_compressed_messaging_session_reads_its_conti
             SimpleNamespace(platform=Platform.TELEGRAM, user_id='human'), 'agent:main:telegram:dm:1')
         reply = await owner.dispatch({'id': 1, 'method': 'session.history', 'params': {'session_id': 'root'}})
         assert 'result' in reply, reply
+        assert reply['result']['session_id'] == 'child'
         rows = {m['text']: m['row_id'] for m in reply['result']['messages'] if m['role'] == 'user'}
         assert rows.get('before compression') == before, rows
         assert rows.get('after compression') == after, rows
