@@ -2568,7 +2568,7 @@ def _inflight_snapshot(session):
     return snapshot
 
 _upstream_history_to_messages = _history_to_messages
-def _history_to_messages(history, *, profile_home=None):
+def _history_to_messages(history, *, profile_home=None, image_urls=True):
     from tui_gateway.mobile_artifact_results import project_mobile_history_message
     visible_history = []
     for message in history:
@@ -2579,7 +2579,7 @@ def _history_to_messages(history, *, profile_home=None):
             visible_history.append({**message, "content": "[Attachment]"})
         else:
             visible_history.append(message)
-    projected = _upstream_history_to_messages(visible_history, profile_home=profile_home)
+    projected = _upstream_history_to_messages(visible_history, profile_home=profile_home, image_urls=image_urls)
     result = []
     for message in projected:
         metadata = message.get("display_metadata")
