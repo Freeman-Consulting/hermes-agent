@@ -405,11 +405,11 @@ class TestRouteLevelRejections:
         # and verify the counter.
         from hermes_cli.dashboard_auth.ws_tickets import consume_ticket, TicketInvalid
         # First consume succeeds
-        info = consume_ticket(ticket)
+        info = consume_ticket(ticket, audience="/api/ws")
         assert info is not None
         # Second consume fails (replayed)
         try:
-            consume_ticket(ticket)
+            consume_ticket(ticket, audience="/api/ws")
             assert False, "Should have raised TicketInvalid"
         except TicketInvalid as exc:
             # The reason_code should be 'replayed'

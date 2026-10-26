@@ -66,9 +66,14 @@ def audit_log_path(tmp_path):
     return tmp_path / "logs" / "dashboard-auth.log"
 
 
-async def _narrow_handle_ws(ws, *, auth_identity=None, subprotocol=None):
+async def _narrow_handle_ws(ws, *, auth_identity=None, operator=False, subprotocol=None):
     """Prove the real route reached its downstream handler, then close."""
-    assert auth_identity == getattr(ws, "_hermes_auth_identity", None)
+    stamped = getattr(ws, "_hermes_auth_identity", None)
+    if stamped is not None:
+        assert auth_identity == {**stamped, "profile_scope": "host"}
+    else:
+        assert auth_identity is None or auth_identity.get("provider") == "session-token"
+    assert operator is True
     assert subprotocol == getattr(ws, "_hermes_ws_subprotocol", None)
     await ws.accept()
     await ws.send_json({"route": "reached"})

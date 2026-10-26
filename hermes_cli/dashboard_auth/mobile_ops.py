@@ -58,7 +58,7 @@ try:
     import subprocess as _sub
     _commit_out = _sub.run(
         ["git", "rev-parse", "--short", "HEAD"],
-        capture_output=True, text=True, timeout=5,
+        capture_output=True, text=True, encoding="utf-8", timeout=5,
     )
     if _commit_out.returncode == 0:
         _runtime_commit = _commit_out.stdout.strip()

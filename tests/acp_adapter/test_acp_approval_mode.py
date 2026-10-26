@@ -121,7 +121,7 @@ class _State:
 )
 def test_default_mode_seeds_unswitched_sessions(monkeypatch, acp, state_mode, expected_mode):
     _cfg(monkeypatch, acp)
-    agent = server.HermesACPAgent.__new__(server.HermesACPAgent)
+    agent = server.HermesACPAgent.__new__(server.HermesACPAgent, object())
     state = _State(state_mode)
     assert agent._session_modes(state).current_mode_id == expected_mode
     policy, _cwd = agent._edit_approval_policy_for_state(state)

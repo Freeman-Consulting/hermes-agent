@@ -12,8 +12,8 @@ def test_anthropic_setup_picker_includes_model_switch_catalog(monkeypatch):
     monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
     # Isolate discovery from the user's credentials, disk cache, and network.
     monkeypatch.setattr("hermes_cli.auth.get_anthropic_key", lambda: "test-key")
-    monkeypatch.setattr("agent.anthropic_adapter.read_claude_code_credentials", lambda: None)
-    monkeypatch.setattr("agent.anthropic_adapter._is_oauth_token", lambda _: False)
+    monkeypatch.setattr("agent.anthropic_credentials.read_claude_code_credentials", lambda: None)
+    monkeypatch.setattr("agent.anthropic_credentials._is_oauth_token", lambda _: False)
     monkeypatch.setattr("agent.models_dev.list_agentic_models", lambda provider: ["claude-opus-5-5"] if provider == "anthropic" else [])
     monkeypatch.setattr("hermes_cli.models.cached_provider_model_ids", lambda provider, **kwargs: list(_PROVIDER_MODELS[provider]))
     monkeypatch.setattr("agent.models_dev.fetch_models_dev", lambda: {})

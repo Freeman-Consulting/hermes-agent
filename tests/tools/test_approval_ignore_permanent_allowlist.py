@@ -57,11 +57,11 @@ def test_check_dangerous_command_prompts_when_ignoring(monkeypatch):
         return "deny"
 
     token = ap.set_ignore_permanent_allowlist(True)
-    itoken = ap.set_hermes_interactive_context(True)  # what ACP sets per run
+    itoken = approval_context.set_hermes_interactive_context(True)  # what ACP sets per run
     try:
         res = ap.check_dangerous_command("rm -rf ./tmpdir", "local", approval_callback=cb)
     finally:
-        ap.reset_hermes_interactive_context(itoken)
+        approval_context.reset_hermes_interactive_context(itoken)
         ap.reset_ignore_permanent_allowlist(token)
     assert res.get("approved") is False
     assert asked, "approval callback must be consulted"
