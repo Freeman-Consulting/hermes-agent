@@ -42,11 +42,9 @@ from typing import Any, Dict, Optional, Tuple
 TTL_SECONDS = 30
 
 _lock = threading.Lock()
-_tickets: Dict[str, Tuple[int, Dict[str, Any]]] = {}  # ticket -> (expires_at, info)
-# Short-lived tombstones distinguish a genuine replay from an arbitrary
-# unknown ticket without retaining the ticket indefinitely.
-_consumed_tickets: Dict[str, int] = {}  # ticket -> tombstone expiry
-_internal_credential: Optional[str] = None  # process-lifetime, guarded by _lock
+_tickets: dict[str, tuple[int, dict[str, Any]]] = {}  # ticket -> (expires_at, info)
+# Short-lived tombstones distinguish replay from unknown tickets.
+_consumed_tickets: dict[str, int] = {}  # ticket -> tombstone expiry
 
 #: The process-lifetime internal credential (see module docstring). Lazily
 #: minted on first ``internal_ws_credential()`` call and stable for the life
@@ -66,29 +64,20 @@ class TicketInvalid(Exception):
         super().__init__(message)
         self.reason_code = reason_code
 
+def mint_ticket(*, user_id: str, provider: str, issuer: str = "",
+                audience: Optional[str] = None, extra: Optional[dict[str, Any]] = None) -> str:
+    """One-shot identity ticket; ``extra`` may carry server-chosen route context.
 
-def mint_ticket(*, user_id: str, provider: str, audience: Optional[str] = None, extra: Optional[Dict[str, Any]] = None) -> str:
-    """Generate a one-shot ticket bound to this user identity.
-
-    The returned token is base64url, 43 bytes of entropy (32-byte random
-    seed). Stash returns the ``info`` dict to the caller on consume so the
-    WS handler can carry the identity forward into its session log.
-
-    ``audience`` optionally narrows where the ticket can be consumed. Browser
-    session tickets omit it and remain valid for the dashboard WS family;
-    mobile-device tickets set ``audience="/api/ws"`` so a phone credential
-    cannot mint a ticket for PTY/console/event sockets.
+    ``issuer`` isolates gateway owners; ``audience`` confines mobile tickets to /api/ws.
+    Caller extras cannot override identity, issuer, or audience.
     """
     ticket = secrets.token_urlsafe(32)
-    info = {
-        "user_id": user_id,
-        "provider": provider,
-        "minted_at": int(time.time()),
-    }
-    if extra:
-        info.update(extra)
-    # Caller-supplied extra must not override the identity or audience.
-    info.update(user_id=user_id, provider=provider)
+    info = {"minted_at": int(time.time()), **(extra or {}),
+            "user_id": user_id, "provider": provider}
+    info.pop("issuer", None)
+    info.pop("audience", None)
+    if issuer:
+        info["issuer"] = issuer
     if audience:
         info["audience"] = audience
     with _lock:
@@ -97,15 +86,8 @@ def mint_ticket(*, user_id: str, provider: str, audience: Optional[str] = None, 
     return ticket
 
 
-def consume_ticket(ticket: str, *, audience: Optional[str] = None) -> Dict[str, Any]:
-    """Validate and consume. Raises :class:`TicketInvalid` on missing/expired/used.
-
-    Single-use semantics: a successful consume immediately removes the
-    ticket from the store, so a second call with the same value raises
-    ``TicketInvalid("unknown ticket: …")``. Audience mismatches also consume
-    the ticket; presenting a ticket to the wrong WS endpoint should not leave
-    it reusable.
-    """
+def consume_ticket(ticket: str, *, audience: Optional[str] = None) -> dict[str, Any]:
+    """Validate and consume one-shot ticket; audience mismatches also consume it."""
     now = int(time.time())
     with _lock:
         entry = _tickets.pop(ticket, None)
@@ -122,7 +104,7 @@ def consume_ticket(ticket: str, *, audience: Optional[str] = None) -> Dict[str, 
         if expires_at < now:
             raise TicketInvalid("expired", reason_code="expired")
         expected_audience = info.get("audience")
-        if audience and expected_audience and expected_audience != audience:
+        if expected_audience and expected_audience != audience:
             raise TicketInvalid("audience mismatch", reason_code="wrong_audience")
         _consumed_tickets[ticket] = now + TTL_SECONDS
         return info
@@ -158,21 +140,8 @@ def internal_ws_credential() -> str:
         return _internal_credential
 
 
-def consume_internal_credential(value: str) -> Dict[str, Any]:
-    """Validate an internal credential. Raises :class:`TicketInvalid` on mismatch.
-
-    Unlike :func:`consume_ticket` this is **not** single-use — the value is
-    not removed on success, so a server-spawned child can present it on every
-    (re)connect. Returns the fixed server-internal identity ``info`` dict
-    (``{user_id, provider}``), mirroring the ``info`` shape ``consume_ticket``
-    returns, so a caller that wants to record the connecting identity can; the
-    current ``_ws_auth_ok`` caller validates for the boolean outcome only and
-    discards the dict.
-
-    A constant-time compare against the (lazily-minted) credential avoids
-    leaking length / prefix information on mismatch. If no internal
-    credential has been minted yet, any value is rejected.
-    """
+def consume_internal_credential(value: str) -> dict[str, Any]:
+    """Validate a multi-use internal credential in constant time; reject before minting."""
     with _lock:
         expected = _internal_credential
     if not value or expected is None:

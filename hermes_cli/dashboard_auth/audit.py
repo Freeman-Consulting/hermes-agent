@@ -16,13 +16,23 @@ import enum
 import json
 import logging
 import os
-import os
 import threading
 from pathlib import Path
 from typing import Any
 
 _log = logging.getLogger(__name__)
 _write_lock = threading.Lock()
+_MAX_FIELD_LENGTH = 256
+_TRUNCATION_MARKER = "...[truncated]"
+
+# Size-based rotation matching hermes_logging's agent.log / errors.log convention
+# (maxBytes=5MB, backupCount=3, stdlib RotatingFileHandler ``.1``/``.2``/``.3`` naming).
+# Implemented locally (check-and-rename, stdlib only) rather than importing
+# hermes_logging/_ManagedRotatingFileHandler: that would pull in hermes_constants
+# (and lazily hermes_cli.config) and break this module's import-light guarantee —
+# it is imported by middleware that runs very early in startup.
+_MAX_BYTES = 5 * 1024 * 1024
+_BACKUP_COUNT = 3
 
 # Canonical field-name stems that must never appear in the log raw.
 # Matching is case-insensitive. Includes both hyphen and underscore
@@ -55,6 +65,7 @@ class AuditEvent(enum.Enum):
     REFRESH_FAILURE = "refresh_failure"
     REVOKE = "revoke"
     SESSION_VERIFY_FAILURE = "session_verify_failure"
+    SESSION_REJECTED = "session_rejected"
     WS_TICKET_MINTED = "ws_ticket_minted"
     WS_TICKET_REJECTED = "ws_ticket_rejected"
     TOKEN_AUTH_SUCCESS = "token_auth_success"
@@ -99,72 +110,67 @@ def _resolve_log_path() -> Path:
 
 
 def _normalize_field_name(name: str) -> str:
-    """Canonicalise a field name for redaction matching.
-
-    Lowercase and replace hyphens with underscores so that
-    'Authorization', 'SET-COOKIE', 'deviceSecret' all map to their
-    canonical stems before comparison.
-    """
     return name.lower().replace("-", "_")
 
 
-def audit_log(event: AuditEvent, **fields: Any) -> None:
-    """Append one event to the audit log.
+def _bounded_value(value: Any) -> Any:
+    """Bound strings, including nested values and non-JSON object representations."""
+    if isinstance(value, dict):
+        return {k: _bounded_value(v) for k, v in value.items()
+                if isinstance(k, str) and _normalize_field_name(k) not in _REDACTED_STEMS}
+    if isinstance(value, (list, tuple)):
+        return [_bounded_value(v) for v in value]
+    if not isinstance(value, (str, int, float, bool, type(None))):
+        value = repr(value)
+    if isinstance(value, str) and len(value) > _MAX_FIELD_LENGTH:
+        return value[:_MAX_FIELD_LENGTH - len(_TRUNCATION_MARKER)] + _TRUNCATION_MARKER
+    return value
 
-    Token-like fields are dropped. Missing log directory is created.
-    Write failures are logged at WARNING but never raise — auth must not
-    fail because the audit logger broke.
-    Audit log files are created with mode 0600.
-    """
-    safe_fields = {
-        k: v for k, v in fields.items()
-        if _normalize_field_name(k) not in _REDACTED_STEMS
-    }
-    entry = {
-        "ts": _dt.datetime.now(_dt.timezone.utc).isoformat(),
-        "event": event.value,
-        **safe_fields,
-    }
-    line = json.dumps(entry, separators=(",", ":")) + "\n"
-    path = _resolve_log_path()
+
+def _rotate_if_needed(path: Path, pending_bytes: int) -> None:
+    """Rotate ``path`` to ``.1``/…/``.<_BACKUP_COUNT>`` once appending *pending_bytes* would
+    reach ``_MAX_BYTES``. Mirrors stdlib ``RotatingFileHandler``'s naming; must be called
+    with ``_write_lock`` held. Rotation errors must not break the write path."""
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        # Restrictive parent directory mode.
-        try:
-            path.parent.chmod(0o700)
-        except OSError:
-            pass
-        # Ensure owner-only mode on the log file itself.
-        if path.exists():
-            try:
-                path.chmod(0o600)
-            except OSError:
-                pass
+        if path.stat().st_size + pending_bytes < _MAX_BYTES:
+            return
+    except OSError:
+        return  # missing/vanished mid-check; the append itself surfaces real errors
+    try:
+        for i in range(_BACKUP_COUNT - 1, 0, -1):
+            src = path.with_name(f"{path.name}.{i}")
+            if src.exists():
+                os.replace(src, path.with_name(f"{path.name}.{i + 1}"))
+        os.replace(path, path.with_name(f"{path.name}.1"))
+    except OSError:
+        pass  # a log that cannot be rotated is still a working (if overlong) log
+
+
+def audit_log(event: AuditEvent, **fields: Any) -> None:
+    """Append one event; token-like fields dropped, log dir created, size-capped rotation
+    (``_MAX_BYTES`` with ``_BACKUP_COUNT`` backups). Write failures are logged at WARNING
+    but never raise — auth must not fail because the audit logger broke."""
+    try:
+        entry = {
+            "ts": _dt.datetime.now(_dt.UTC).isoformat(),
+            "event": event.value,
+            **{k: _bounded_value(v) for k, v in fields.items() if _normalize_field_name(k) not in _REDACTED_STEMS}}
+        line = json.dumps(entry, separators=(",", ":")) + "\n"
+        line_bytes = line.encode("utf-8")
+        path = _resolve_log_path()
+        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         with _write_lock:
-            # Use os.open with explicit mode so umask cannot leave
-            # a world-readable audit log. Single ownership: os.fdopen
-            # owns the fd and closes it on exit.
-            fd = os.open(
-                str(path),
-                os.O_CREAT | os.O_WRONLY | os.O_APPEND,
-                0o600,
-            )
-            with os.fdopen(fd, "a", encoding="utf-8") as f:
-                f.write(line)
+            path.parent.chmod(0o700)
+            if path.exists():
+                path.chmod(0o600)
+            _rotate_if_needed(path, len(line_bytes))
+            fd = os.open(path, os.O_CREAT | os.O_WRONLY | os.O_APPEND | getattr(os, "O_NOFOLLOW", 0), 0o600)
+            with os.fdopen(fd, "ab") as f:
+                f.write(line_bytes)
     except Exception as e:
         _log.warning("dashboard-auth audit log write failed: %s", e)
 
 
 def ticket_fingerprint(ticket: str) -> str:
-    """One-way SHA-256-derived fingerprint for a ticket value.
-
-    Returns the first 16 hex characters of the SHA-256 hash — a short
-    deterministic identifier that can be logged to correlate mint and
-    acceptance events without exposing the raw ticket.
-    """
     import hashlib
     return hashlib.sha256(ticket.encode("utf-8")).hexdigest()[:16]
-
-# ---- BEGIN PLUGIN-COMPAT (revert-scheduled; see COMPAT_MANIFEST.md) ----
-# External plugins imported os from this module before decomposition.
-# ---- END PLUGIN-COMPAT ----

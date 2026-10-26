@@ -28,7 +28,7 @@ import time
 # session's batch deadline. State is process-global like the rest of this module's approval state; entries
 # are bounded by _HUMAN_WAIT_MAX_SESSIONS.
 class _HumanWaitState:
-    __slots__ = ("pending", "window_started", "completed_seconds")
+    __slots__ = ("completed_seconds", "pending", "window_started")
 
     def __init__(self) -> None:
         self.pending = 0
@@ -51,13 +51,14 @@ def human_wait_ceiling() -> float:
     bound the tool batch stops waiting before the editor has answered.
     """
     from tools import approval_context
+    from agent.deadline import MAX_SAFE_TIMEOUT_S
     base = float(approval_context._get_approval_timeout())
     try:
         from acp_adapter.server import _acp_approval_timeout
         base = max(base, _acp_approval_timeout())
     except Exception:
         pass  # ACP is optional; keep the shared approval bound
-    return base + HUMAN_WAIT_MARGIN_S
+    return min(MAX_SAFE_TIMEOUT_S, base + HUMAN_WAIT_MARGIN_S)
 
 
 def _clamped_window_seconds(started: float, now: float, ceiling: float) -> float:
