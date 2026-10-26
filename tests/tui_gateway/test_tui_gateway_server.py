@@ -16070,6 +16070,9 @@ def test_session_search_honors_profile_and_closes_dedicated_db(monkeypatch, tmp_
         lambda profile: profile_home if profile == "search-profile" else None,
     )
     monkeypatch.setattr(server, "_get_db", lambda: (_ for _ in ()).throw(AssertionError("launch DB must not be used")))
+    # Browsing requires an owner-initialized store (upstream _profile_db bootstrap), even with a fake DB projection.
+    from hermes_state import SessionDB as _RealSessionDB
+    _RealSessionDB(db_path=profile_home / "state.db").close()
     monkeypatch.setattr("hermes_state.SessionDB", ProfileDB)
 
     resp = server.handle_request(

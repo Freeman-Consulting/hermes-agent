@@ -450,7 +450,7 @@ def _reset_auxiliary_runtime_main():
     provider (order-dependent failures in ``tests/agent/test_auxiliary_*``).
     """
     yield
-    if (aux := sys.modules.get("agent.auxiliary_client")) is not None:
+    if (aux := sys.modules.get("agent.auxiliary_client")) is not None and hasattr(aux, "clear_runtime_main"):
         aux.clear_runtime_main()
 
 
