@@ -95,12 +95,12 @@ def _assert_generation_probe_preserves_lock(tmp_path):
         conn.close()
 
 
-@pytest.mark.macos_only
+@pytest.mark.platforms("macos")
 def test_generation_probe_preserves_posix_locks_macos(tmp_path):
     _assert_generation_probe_preserves_lock(tmp_path)
 
 
-@pytest.mark.linux_only
+@pytest.mark.platforms("linux")
 def test_generation_probe_preserves_posix_locks_linux(tmp_path):
     _assert_generation_probe_preserves_lock(tmp_path)
 
