@@ -3298,6 +3298,7 @@ export interface SessionListParams {
   title?: string | null
   limit?: number | null
   include_hidden?: boolean
+  preview?: 'first' | 'latest'
 }
 export interface SessionListResult {
   sessions: SessionListRow[]

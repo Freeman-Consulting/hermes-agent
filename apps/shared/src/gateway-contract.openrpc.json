@@ -37816,6 +37816,15 @@
             "default": false,
             "title": "Include Hidden",
             "type": "boolean"
+          },
+          "preview": {
+            "default": "first",
+            "enum": [
+              "first",
+              "latest"
+            ],
+            "title": "Preview",
+            "type": "string"
           }
         },
         "title": "SessionListParams",

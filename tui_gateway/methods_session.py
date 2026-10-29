@@ -576,7 +576,14 @@ def _(rid, params: dict, db) -> dict:
         # No live_message_count here on purpose: the bulk listing serves rows whose open
         # paths never demand history (expectHistory defaults false); the count is a
         # per-session scan and would turn one listing call into hundreds of them.
-        return _ok(rid, {"sessions": [_session_row_summary(s) for s in rows]})
+        summaries = [_session_row_summary(s) for s in rows]
+        if params.get("preview") == "latest":
+            # Opt-in "where the conversation IS" preview (mobile list): newest user/assistant text,
+            # one indexed LIMIT-1 read per returned row. Default stays the first-prompt head.
+            from tui_gateway.methods_profiles import _latest_message_preview
+            for summary in summaries:
+                summary["preview"] = _latest_message_preview(db, summary["id"]) or summary["preview"]
+        return _ok(rid, {"sessions": summaries})
     except Exception as e:
         return _err(rid, 5006, str(e))
 

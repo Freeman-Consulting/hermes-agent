@@ -5,6 +5,8 @@ listing/browsing stored rows, spawn-tree snapshots, event replay and the statele
 
 from __future__ import annotations
 
+from typing import Literal
+
 from pydantic import Field
 
 from .base import JsonValue, Params, Result, WireEnum
@@ -223,6 +225,9 @@ class SessionListParams(ProfileParams):
     title: str | None = None  # exact-title lookup (title as identity); windowless
     limit: int | None = None
     include_hidden: bool = False
+    # "latest": each row's ``preview`` is its newest user/assistant text (mobile list) instead of the
+    # first prompt. Older servers reject the key (4000); clients fall back to the default.
+    preview: Literal["first", "latest"] = "first"
 
 
 class SessionListRow(Result):
