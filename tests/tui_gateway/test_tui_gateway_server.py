@@ -16044,6 +16044,48 @@ def test_session_search_real_db_finds_message_body(monkeypatch, tmp_path):
         db.close()
 
 
+def test_session_search_content_hits_come_from_readable_text(monkeypatch, tmp_path):
+    """Mobile/desktop search shows people's words: a term that only appears in an assistant row's
+    tool-call arguments, or in a Hermes notice row, is not a content hit; a real hit's excerpt is
+    cut from the message text."""
+    from hermes_state import SessionDB
+
+    db = SessionDB(db_path=tmp_path / "state.db")
+    try:
+        # More tool-only matches than one scan window holds, so a filter applied after the scan
+        # would find nothing.
+        db.create_session("tools-only", source="tui")
+        for call in range(60):
+            db.append_message(
+                "tools-only",
+                role="assistant",
+                content="Let me look.",
+                tool_calls=[{"id": f"call_{call}", "type": "function",
+                             "function": {"name": "terminal",
+                                          "arguments": "{\"command\": \"grep marmalade marmalade src\"}"}}],
+            )
+        db.create_session("notice-only", source="tui")
+        db.append_message(
+            "notice-only",
+            role="user",
+            content="[IMPORTANT: Background process proc_1 completed. Output: marmalade]",
+            display_kind="process_complete",
+        )
+        db.create_session("spoken", source="tui")
+        db.append_message("spoken", role="user", content="Please buy marmalade and bread on the way home.")
+        monkeypatch.setattr(server, "_get_db", lambda: db)
+
+        resp = server.handle_request(
+            {"id": "search-readable", "method": "session.search", "params": {"query": "marmalade", "limit": 5}}
+        )
+        assert "error" not in resp, resp
+        content_hits = [row for row in resp["result"]["results"] if row["match_kind"] == "content"]
+        assert [row["id"] for row in content_hits] == ["spoken"]
+        assert content_hits[0]["snippet"] == "Please buy >>>marmalade<<< and bread on the way home."
+    finally:
+        db.close()
+
+
 def test_session_search_honors_profile_and_closes_dedicated_db(monkeypatch, tmp_path):
     seen = {}
     profile_home = tmp_path / "profiles" / "search-profile"

@@ -668,6 +668,58 @@ def _(rid, params: dict) -> dict:
         except (AttributeError, NotImplementedError):
             return root_id
 
+    # Content hits come from what people read: ``readable_only`` (below) makes the store skip
+    # rows whose only match is in tool-call arguments, and Hermes notices. FTS still picks its
+    # snippet from whichever column matched best (often the tool-call JSON), so the excerpt is
+    # cut from the message text here instead.
+    operators = frozenset({"AND", "OR", "NOT", "NEAR"})
+    terms = [
+        term for term in (
+            token.strip('"*()').lower() for token in query.replace('"', " ").split()
+        )
+        if term and term.upper() not in operators
+    ]
+
+    def message_texts(match_ids):
+        """{message id: content}; empty when the store cannot read rows (FTS snippets are kept)."""
+        import sqlite3  # handlers run with the server's globals (bind_module)
+
+        ids = [m for m in match_ids if m is not None]
+        if not ids:
+            return {}
+        try:
+            placeholders = ",".join("?" * len(ids))
+            rows = db._read_all(f"SELECT id, content FROM messages WHERE id IN ({placeholders})", ids)
+        except (AttributeError, NotImplementedError, sqlite3.Error):
+            return {}
+        return {item["id"]: item["content"] for item in rows if isinstance(item["content"], str)}
+
+    def text_excerpt(content, width=160):
+        """About `width` characters around the first query term, terms marked >>> <<<."""
+        flat = " ".join(content.split())
+        lowered = flat.lower()
+        hits = [lowered.find(term) for term in terms if lowered.find(term) >= 0]
+        start = max(min(hits, default=0) - width // 3, 0)
+        piece = flat[start:start + width]
+        lowered_piece = piece.lower()
+        marked, cursor = [], 0
+        while cursor < len(piece):
+            found = [(lowered_piece.find(term, cursor), term) for term in terms]
+            found = [(at, term) for at, term in found if at >= 0]
+            if not found:
+                marked.append(piece[cursor:])
+                break
+            at, term = min(found)
+            marked.append(piece[cursor:at])
+            marked.append(">>>" + piece[at:at + len(term)] + "<<<")
+            cursor = at + len(term)
+        text = "".join(marked)
+        if start > 0:
+            text = "..." + text
+        if start + width < len(flat):
+            text += "..."
+        return text
+
     def result_row(row, *, snippet, kind, role=None, timestamp=None, count=1, root=None):
         return {
             "id": row["id"],
@@ -689,30 +741,50 @@ def _(rid, params: dict) -> dict:
         if db is None:
             return _db_unavailable_error(rid, code=5006)
         try:
-            raw_matches = db.search_messages(
-                query,
-                exclude_sources=["kanban", "tool"],
-                role_filter=["user", "assistant"],
-                limit=scan_limit,
-                offset=offset,
-                fields=("id", "session_id", "role", "snippet", "timestamp", "source"),
-            )
-
+            # Most matches can sit in conversations the list never shows (archived, hidden,
+            # internal), so one scan window can come back with no visible hit at all. Page
+            # through up to `max_windows` windows until `limit` visible conversations are found.
+            max_windows = 5
+            cursor = offset
+            exhausted = False
             grouped = {}
-            for match in raw_matches:
-                raw_session_id = str(match.get("session_id") or "").strip()
-                if not raw_session_id:
-                    continue
-                root_id = compression_root(raw_session_id)
-                bucket = grouped.setdefault(root_id, {"first": match, "count": 0})
-                bucket["count"] += 1
+            visible_roots = {}
+            for _window in range(max_windows):
+                raw_matches = db.search_messages(
+                    query,
+                    exclude_sources=["kanban", "tool"],
+                    role_filter=["user", "assistant"],
+                    limit=scan_limit,
+                    offset=cursor,
+                    fields=("id", "session_id", "role", "snippet", "timestamp", "source"),
+                    readable_only=True,
+                )
+                cursor += len(raw_matches)
+                texts = message_texts([match.get("id") for match in raw_matches])
+                for match in raw_matches:
+                    raw_session_id = str(match.get("session_id") or "").strip()
+                    if not raw_session_id:
+                        continue
+                    content = texts.get(match.get("id"))
+                    if content and terms:
+                        match = {**match, "snippet": text_excerpt(content)}
+                    root_id = compression_root(raw_session_id)
+                    bucket = grouped.setdefault(root_id, {"first": match, "count": 0})
+                    bucket["count"] += 1
+                    if root_id not in visible_roots:
+                        row = session_record(lineage_tip(root_id))
+                        visible_roots[root_id] = row if eligible(row) else None
+                if len(raw_matches) < scan_limit:
+                    exhausted = True
+                    break
+                if sum(1 for row in visible_roots.values() if row) >= limit:
+                    break
 
             results = []
             seen = set()
             for root_id, bucket in grouped.items():
-                tip_id = lineage_tip(root_id)
-                row = session_record(tip_id)
-                if not eligible(row):
+                row = visible_roots.get(root_id)
+                if not row:
                     continue
                 first = bucket["first"]
                 results.append(
@@ -770,8 +842,8 @@ def _(rid, params: dict) -> dict:
                 rid,
                 {
                     "results": results,
-                    "has_more": len(raw_matches) == scan_limit,
-                    "next_offset": offset + len(raw_matches),
+                    "has_more": not exhausted,
+                    "next_offset": cursor,
                 },
             )
         except Exception:

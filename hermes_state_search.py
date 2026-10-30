@@ -161,10 +161,26 @@ def _search_select_sql(snippet_sql: str, from_sql: str, where: list[str], order_
         """
 
 
+# Rows Hermes writes as notices (a background process finishing, a delegation reporting back,
+# a model switch): real user/assistant rows, but not something a person said or read as a reply.
+READABLE_EXCLUDED_DISPLAY_KINDS = (
+    "hidden", "process_complete", "internal_notification", "async_delegation_complete",
+    "auto_continue", "model_switch", "personality_switch",
+)
+READABLE_LEGACY_NOTICE_PREFIX = "[IMPORTANT: Background process"
+
+
+def _readable_terms(query: str) -> list[str]:
+    """The plain words of a sanitized FTS query (operators, quotes and prefix stars dropped)."""
+    return [tok for tok in (t.strip('"').strip("*").strip() for t in _LIKE_TOKEN_RE.findall(query))
+            if tok and tok.upper() not in _LIKE_SKIP_TOKENS]
+
+
 def _search_filter_clauses(
     where: list[str], params: list, *, include_inactive: bool, source_filter: Optional[list[str]],
     exclude_sources: Optional[list[str]], role_filter: Optional[list[str]],
-    after_ts: Optional[int] = None, before_ts: Optional[int] = None) -> None:
+    after_ts: Optional[int] = None, before_ts: Optional[int] = None,
+    readable_terms: Optional[list[str]] = None) -> None:
     """Append the visibility/source/role/session-start predicates every search route shares. Live
     rows (active=1) AND compaction-archived rows (compacted=1) are discoverable; only
     rewind/undo rows (active=0, compacted=0) are hidden. ``after_ts``/``before_ts`` bound
@@ -189,6 +205,17 @@ def _search_filter_clauses(
     if before_ts is not None:
         where.append("s.started_at < ?")
         params.append(int(before_ts))
+    if readable_terms:
+        # Readable-only: a query term must be in the message text itself (not only in tool-call
+        # arguments or a tool name), and Hermes notices are skipped. Applied inside the query so
+        # LIMIT fills with readable hits instead of being used up by tool rows.
+        where.append("(" + " OR ".join(["m.content LIKE ? ESCAPE '\\'"] * len(readable_terms)) + ")")
+        params.extend(f"%{_escape_like(term)}%" for term in readable_terms)
+        where.append(f"COALESCE(m.display_kind, '') NOT IN ({','.join('?' for _ in READABLE_EXCLUDED_DISPLAY_KINDS)})")
+        params.extend(READABLE_EXCLUDED_DISPLAY_KINDS)
+        # Background-process notices written before display_kind existed.
+        where.append("m.content NOT LIKE ?")
+        params.append(f"{READABLE_LEGACY_NOTICE_PREFIX}%")
 
 
 class SessionSearchMixin:
@@ -1071,7 +1098,7 @@ class SessionSearchMixin:
         self, query: str, source_filter: list[str] | None = None, exclude_sources: list[str] | None = None,
         role_filter: list[str] | None = None, limit: int = 20, offset: int = 0, sort: str | None = None,
         include_inactive: bool = False, fields: Optional[Collection[str]] = None,
-        after_ts: Optional[int] = None, before_ts: Optional[int] = None,
+        after_ts: Optional[int] = None, before_ts: Optional[int] = None, readable_only: bool = False,
     ) -> list[dict[str, Any]]:
         """:meth:`_search_messages_impl` plus one log line per slow search with the routing
         path taken. Threshold HERMES_SEARCH_SLOW_MS (default 1000; 0 logs every call)."""
@@ -1081,7 +1108,7 @@ class SessionSearchMixin:
             rows = self._search_messages_impl(
                 query, source_filter=source_filter, exclude_sources=exclude_sources, role_filter=role_filter,
                 limit=limit, offset=offset, sort=sort, include_inactive=include_inactive, fields=fields,
-                after_ts=after_ts, before_ts=before_ts)
+                after_ts=after_ts, before_ts=before_ts, readable_only=readable_only)
             return rows
         finally:
             elapsed_ms = (time.time() - started) * 1000.0
@@ -1094,7 +1121,7 @@ class SessionSearchMixin:
         self, query: str, source_filter: list[str] | None = None, exclude_sources: list[str] | None = None,
         role_filter: list[str] | None = None, limit: int = 20, offset: int = 0, sort: str | None = None,
         include_inactive: bool = False, fields: Optional[Collection[str]] = None,
-        after_ts: Optional[int] = None, before_ts: Optional[int] = None,
+        after_ts: Optional[int] = None, before_ts: Optional[int] = None, readable_only: bool = False,
     ) -> list[dict[str, Any]]:
         """FTS5 search across session messages (keywords, ``"phrases"``, AND/OR/NOT, ``prefix*``).
         Returns snippet + session metadata + 1-message context per hit; ``fields`` selects a
@@ -1102,7 +1129,8 @@ class SessionSearchMixin:
         CJK LIKE fallback ignores it). Rewound rows (``active=0, compacted=0``) are excluded
         by default; compaction-archived rows ARE included; ``include_inactive`` = every row.
         ``after_ts``/``before_ts`` bound ``sessions.started_at`` on every route (FTS5, CJK,
-        trigram, LIKE fallback, unindexed-gap supplement)."""
+        trigram, LIKE fallback, unindexed-gap supplement). ``readable_only`` keeps rows whose
+        message text contains a query term and which are not Hermes notices, on every route."""
         result_fields = self._search_message_fields(fields)
         if not query or not query.strip():
             return []
@@ -1111,7 +1139,8 @@ class SessionSearchMixin:
             return []
         filters = dict(include_inactive=include_inactive, source_filter=source_filter,
                        exclude_sources=exclude_sources, role_filter=role_filter,
-                       after_ts=after_ts, before_ts=before_ts)
+                       after_ts=after_ts, before_ts=before_ts,
+                       readable_terms=(_readable_terms(query) or None) if readable_only else None)
         # New oversized tool results index only a bounded prefix; an explicit tool-role search is the
         # opt-in full-body path and scans canonical rows via LIKE.
         if role_filter and "tool" in role_filter:
@@ -1219,7 +1248,7 @@ class SessionSearchMixin:
         like_params: list = [p for tok in non_op_tokens for p in _like_params(tok)]
         like_where = [f"({' OR '.join([_LIKE_ANY_COLUMN_SQL] * len(non_op_tokens))})"]
         filters = {k: route[k] for k in ("include_inactive", "source_filter", "exclude_sources", "role_filter",
-                                         "after_ts", "before_ts")}
+                                         "after_ts", "before_ts", "readable_terms")}
         _search_filter_clauses(like_where, like_params, **filters)
         # instr() for the snippet uses the first search token.
         return self._like_rows(like_where, [non_op_tokens[0], *like_params, route["limit"], route["offset"]],
