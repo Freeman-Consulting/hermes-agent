@@ -571,8 +571,14 @@ def _(rid, params: dict, db) -> dict:
         # A store without a path has no profile config to read, so it keeps the default shape.
         db_path = getattr(db, "db_path", None)
         include_subagents = bool(db_path) and show_subagent_sessions(Path(db_path).parent)
+        include_pinned = _flag(params, "include_pinned")
         rows = _listing_rows(db, max(limit * 2, 200), include_hidden=_flag(params, "include_hidden"),
-                             include_subagents=include_subagents)[:limit]
+                             include_subagents=include_subagents, include_pinned=include_pinned)
+        if include_pinned:
+            # The newest `limit` rows, then every pin older than that window.
+            rows = rows[:limit] + [row for row in rows[limit:] if row.get("pinned")]
+        else:
+            rows = rows[:limit]
         # No live_message_count here on purpose: the bulk listing serves rows whose open
         # paths never demand history (expectHistory defaults false); the count is a
         # per-session scan and would turn one listing call into hundreds of them.
@@ -1559,6 +1565,32 @@ def _(rid, params: dict) -> dict:
                     return _err(rid, 4001, "session not found")
                 db.set_session_archived(key, archived)
             return _ok(rid, {"archived": archived, "session_key": key})
+        except Exception as e:
+            return _err(rid, 5007, str(e))
+
+
+@method("session.pin")
+def _(rid, params: dict) -> dict:
+    """Set/clear ``pinned`` on a session + lineage, the Desktop sidebar pin (REST PATCH parity): a LIVE
+    runtime id first, then a stored id/key/title in the profile db. Pinning also unhides the session."""
+    if "pinned" not in params:
+        return _err(rid, 4021, "pinned required")
+    pinned = is_truthy_value(params["pinned"])
+    target = str(params.get("session_id") or params.get("session_key") or "")
+    if not target:
+        return _err(rid, 4006, "session_id required")
+    session = _sessions.get(target)
+    with (_profile_db(params, writer=True) if session is None else _session_db(session)) as db:
+        if db is None:
+            return _db_unavailable_error(rid, code=5007)
+        try:
+            if session is not None:
+                key = session["session_key"]
+            elif not (key := db.resolve_session_id(target) if hasattr(db, "resolve_session_id") else target):
+                return _err(rid, 4001, "session not found")
+            if not db.set_session_pinned(key, pinned):
+                return _err(rid, 4001, "session not found")
+            return _ok(rid, {"pinned": pinned, "session_key": key})
         except Exception as e:
             return _err(rid, 5007, str(e))
 

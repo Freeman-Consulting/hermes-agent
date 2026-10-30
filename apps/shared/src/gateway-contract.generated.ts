@@ -3299,6 +3299,7 @@ export interface SessionListParams {
   limit?: number | null
   include_hidden?: boolean
   preview?: 'first' | 'latest'
+  include_pinned?: boolean
 }
 export interface SessionListResult {
   sessions: SessionListRow[]
@@ -3413,6 +3414,17 @@ export interface SessionArchiveParams {
 }
 export interface SessionArchiveResult {
   archived: boolean
+  session_key: string
+}
+/** ``session_id`` (or its ``session_key`` alias) is a live runtime id first, else a stored id / key / title. ``pinned`` is required, so a client that drops the flag cannot pin or unpin by accident. */
+export interface SessionPinParams {
+  session_id?: string | null
+  session_key?: string | null
+  pinned: boolean
+  profile?: string | null
+}
+export interface SessionPinResult {
+  pinned: boolean
   session_key: string
 }
 export interface SessionWorkspaceMoveParams {
@@ -6490,6 +6502,8 @@ export interface RpcMethods {
   'session.list': { params: SessionListParams; result: SessionListResult }
   /** Most recent human-facing session; errors fold into a null session_id. */
   'session.most_recent': { params: SessionMostRecentParams; result: SessionMostRecentResult }
+  /** Set/clear pinned on a session + lineage (pinning also unhides it); Desktop PATCH parity. */
+  'session.pin': { params: SessionPinParams; result: SessionPinResult }
   /** Redirect the active turn (queued for the next turn while the agent is still building). */
   'session.redirect': { params: SessionCorrectionParams; result: SessionCorrectionResult }
   /** Attach to a stored session: reuse it if live here, else lazy / deferred / cold / eager rebuild. */
@@ -6815,6 +6829,7 @@ export const RPC_METHODS = [
   'session.interrupt',
   'session.list',
   'session.most_recent',
+  'session.pin',
   'session.redirect',
   'session.resume',
   'session.save',

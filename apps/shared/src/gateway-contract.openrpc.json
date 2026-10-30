@@ -3535,6 +3535,24 @@
       }
     },
     {
+      "name": "session.pin",
+      "summary": "Set/clear pinned on a session + lineage (pinning also unhides it); Desktop PATCH parity.",
+      "params": [
+        {
+          "name": "params",
+          "schema": {
+            "$ref": "#/components/schemas/SessionPinParams"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/SessionPinResult"
+        }
+      }
+    },
+    {
       "name": "session.redirect",
       "summary": "Redirect the active turn (queued for the next turn while the agent is still building).",
       "params": [
@@ -37825,6 +37843,11 @@
             ],
             "title": "Preview",
             "type": "string"
+          },
+          "include_pinned": {
+            "default": false,
+            "title": "Include Pinned",
+            "type": "boolean"
           }
         },
         "title": "SessionListParams",
@@ -38384,6 +38407,76 @@
           "session_id"
         ],
         "title": "SessionParams",
+        "type": "object"
+      },
+      "SessionPinParams": {
+        "additionalProperties": false,
+        "description": "``session_id`` (or its ``session_key`` alias) is a live runtime id first, else a stored id / key / title.\n``pinned`` is required, so a client that drops the flag cannot pin or unpin by accident.",
+        "properties": {
+          "session_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Session Id"
+          },
+          "session_key": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Session Key"
+          },
+          "pinned": {
+            "title": "Pinned",
+            "type": "boolean"
+          },
+          "profile": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Profile"
+          }
+        },
+        "required": [
+          "pinned"
+        ],
+        "title": "SessionPinParams",
+        "type": "object"
+      },
+      "SessionPinResult": {
+        "additionalProperties": false,
+        "properties": {
+          "pinned": {
+            "title": "Pinned",
+            "type": "boolean"
+          },
+          "session_key": {
+            "title": "Session Key",
+            "type": "string"
+          }
+        },
+        "required": [
+          "pinned",
+          "session_key"
+        ],
+        "title": "SessionPinResult",
         "type": "object"
       },
       "SessionPruneParams": {

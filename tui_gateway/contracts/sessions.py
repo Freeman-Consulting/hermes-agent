@@ -228,6 +228,9 @@ class SessionListParams(ProfileParams):
     # "latest": each row's ``preview`` is its newest user/assistant text (mobile list) instead of the
     # first prompt. Older servers reject the key (4000); clients fall back to the default.
     preview: Literal["first", "latest"] = "first"
+    # True: pinned sessions older than the ``limit`` window are appended after it (Desktop's
+    # REST list does the same), so a client paging the newest rows still sees every pin.
+    include_pinned: bool = False
 
 
 class SessionListRow(Result):
@@ -392,6 +395,25 @@ class SessionArchiveResult(Result):
 
 method("session.archive", params=SessionArchiveParams, result=SessionArchiveResult,
        doc="Set/clear archived (soft-hide, messages kept) on a session + lineage; Desktop PATCH parity.")
+
+
+class SessionPinParams(Params):
+    """``session_id`` (or its ``session_key`` alias) is a live runtime id first, else a stored id / key / title.
+    ``pinned`` is required, so a client that drops the flag cannot pin or unpin by accident."""
+
+    session_id: str | None = None
+    session_key: str | None = None
+    pinned: bool
+    profile: str | None = None
+
+
+class SessionPinResult(Result):
+    pinned: bool
+    session_key: str
+
+
+method("session.pin", params=SessionPinParams, result=SessionPinResult,
+       doc="Set/clear pinned on a session + lineage (pinning also unhides it); Desktop PATCH parity.")
 
 
 class SessionWorkspaceMoveParams(ProfileParams):
