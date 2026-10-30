@@ -52,3 +52,45 @@ def test_fallback_entry_own_extras_still_apply(monkeypatch):
     extras = _wire_extras(_kwargs(monkeypatch, dest, {"extra_body": {"service_tier": "auto"}}))
     assert extras.get("service_tier") == "auto"
     assert "chat_template_kwargs" not in extras
+
+
+class _CaptureClient:
+    """Stands in for the resolved wire client: records the request call_llm actually sends."""
+
+    def __init__(self):
+        self.sent = None
+        outer = self
+
+        class _Completions:
+            def create(self, **kwargs):
+                outer.sent = kwargs
+                from types import SimpleNamespace as NS
+                msg = NS(content="summary", tool_calls=None, reasoning_content=None, refusal=None)
+                return NS(choices=[NS(message=msg, finish_reason="stop", index=0)], usage=None, model="m")
+
+        self.chat = type("C", (), {"completions": _Completions()})()
+        self.base_url = "https://api.anthropic.com"
+        self.api_key = "x"
+
+
+def _call_with_explicit_provider(monkeypatch, provider):
+    monkeypatch.setattr(ac, "_get_auxiliary_task_config", lambda task: dict(TASK_CFG))
+    client = _CaptureClient()
+    monkeypatch.setattr(
+        ac, "_resolve_call_client",
+        lambda task, **kw: (client, kw.get("model") or "m", provider, provider),
+    )
+    ac.call_llm(task="compression", provider=provider, model="claude-opus-5-5",
+                messages=[{"role": "user", "content": "summarize"}])
+    return (client.sent or {}).get("extra_body") or {}
+
+
+def test_explicit_main_model_retry_drops_primary_extras(monkeypatch):
+    """Compression's own main-model fallback (aux model 404 -> retry naming the main provider)
+    bypasses the fallback chain; it must not carry vLLM chat_template_kwargs to Anthropic."""
+    assert "chat_template_kwargs" not in _call_with_explicit_provider(monkeypatch, "anthropic")
+
+
+def test_explicit_primary_provider_keeps_extras(monkeypatch):
+    extras = _call_with_explicit_provider(monkeypatch, "gb10-qwen")
+    assert extras.get("chat_template_kwargs") == {"enable_thinking": False}

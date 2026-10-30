@@ -7504,6 +7504,17 @@ def _prepare_aux_request(
     if api_mode:
         resolved_api_mode = api_mode
     effective_extra_body = _get_task_extra_body(task)
+    if task and provider:
+        # An explicit provider other than the task's configured one (e.g. compression's
+        # main-model fallback after the aux model 404s) must not inherit the primary
+        # backend's extras: Anthropic 400s on vLLM ``chat_template_kwargs``.
+        primary = str(_get_auxiliary_task_config(task).get("provider") or "").strip().lower()
+        if primary and primary != str(provider).strip().lower():
+            raw_task_body = _get_auxiliary_task_config(task).get("extra_body")
+            if isinstance(raw_task_body, dict):
+                for key, value in raw_task_body.items():
+                    if key != "reasoning" and effective_extra_body.get(key) == value:
+                        effective_extra_body.pop(key, None)
     effective_extra_body.update(extra_body or {})
     client, final_model, resolved_provider, effective_provider = _resolve_call_client(
         task, provider=provider, model=model, base_url=base_url, api_key=api_key,
