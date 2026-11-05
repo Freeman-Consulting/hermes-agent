@@ -1134,6 +1134,39 @@ class TestPgrepKillExpansion:
         assert dangerous is False
 
 
+class TestPkillOsascriptSelfTermination:
+    """On macOS the launchd gateways (ai.hermes.gateway*) run as
+    /usr/bin/osascript -l JavaScript -e '...hermes gateway run...', so a bare
+    `pkill -f osascript` / `killall osascript` SIGTERMs both gateways even
+    though the command never mentions hermes/gateway (incident: ds4 subagent
+    pkill'd osascript and killed ai.hermes.gateway + gateway-fletch).
+    """
+
+    @pytest.mark.parametrize("command", [
+        "pkill -f osascript",
+        'pkill -f "osascript"',
+        "killall osascript",
+        "pkill osascript; echo done",
+        # Real incident command: pkill then a benign osascript quit in one line.
+        'pkill -f "osascript" 2>/dev/null; osascript -e \'quit app id "com.example.app"\'',
+    ])
+    def test_pkill_osascript_flagged(self, command):
+        dangerous, _key, desc = detect_dangerous_command(command)
+        assert dangerous is True, command
+        assert "osascript" in desc.lower()
+
+    @pytest.mark.parametrize("command", [
+        # Plain osascript use (no kill verb) must stay unprompted.
+        """osascript -e 'quit app id "com.apple.Safari"'""",
+        """osascript -e 'display notification "hi"'""",
+        # Unrelated pkill/killall targets must stay unprompted.
+        "pkill -f nginx",
+        "killall Finder",
+    ])
+    def test_non_self_termination_stays_unprompted(self, command):
+        assert detect_dangerous_command(command) == (False, None, None), command
+
+
 class TestLaunchctlGatewayLifecycle:
     """launchctl stop/kickstart/bootout/unload against the Hermes service
     label achieves the same effect as `hermes gateway stop|restart` and

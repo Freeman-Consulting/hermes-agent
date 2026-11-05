@@ -394,6 +394,12 @@ DANGEROUS_PATTERNS = [
     (r'\bnohup\b.*gateway\s+run\b', "start gateway outside systemd (use 'systemctl --user restart hermes-gateway')"),
     # Self-termination protection: prevent agent from killing its own process
     (r'\b(pkill|killall)\b.*\b(hermes|gateway|cli\.py)\b', "kill hermes/gateway process (self-termination)"),
+    # On macOS the launchd gateways (ai.hermes.gateway*) run as
+    # /usr/bin/osascript -l JavaScript -e '...hermes gateway run...', so a bare
+    # `pkill -f osascript` / `killall osascript` SIGTERMs both gateways even though
+    # the command never mentions hermes/gateway. The verb anchor keeps a plain
+    # `osascript -e 'quit app id "..."'` (no pkill/killall) unprompted.
+    (r'\b(pkill|killall)\b[^|;&]*\bosascript\b', "kill osascript (macOS Hermes gateway launchd wrapper; self-termination)"),
     # Self-termination via kill + $(pgrep/pidof): the substitution is opaque to the name-based
     # pattern above, so catch the structural form.
     (r'\bkill\b.*\$\(\s*(pgrep|pidof)\b', "kill process via pgrep/pidof expansion (self-termination)"),
