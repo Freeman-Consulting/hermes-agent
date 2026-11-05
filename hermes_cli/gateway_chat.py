@@ -9,7 +9,7 @@ from pathlib import Path
 import sys
 import uuid
 
-from hermes_cli.gateway_client import RESUME_KEY_MISMATCH, GatewayClientError, connect_gateway
+from hermes_cli.gateway_client import RESUME_KEY_MISMATCH, GatewayClientError, GatewayRPCError, connect_gateway
 from hermes_cli.gateway_connection import RESUME_REFUSALS
 
 # These options change execution or require frontend facilities not yet exposed by
@@ -46,6 +46,31 @@ _ENV_LAUNCH_FLAGS = (("yolo", "HERMES_YOLO_MODE"), ("ignore_rules", "HERMES_IGNO
 def env_launch_flags() -> dict:
     from utils import is_truthy_value
     return {field: True for field, name in _ENV_LAUNCH_FLAGS if is_truthy_value(os.environ.get(name))}
+
+
+def _source_refused(exc: BaseException) -> bool:
+    data = getattr(exc, "data", None)
+    fields = data.get("fields") if isinstance(data, dict) else None
+    return str(exc) == "invalid_params" and isinstance(fields, list) and "source" in fields
+
+
+async def _session_create(client, source, sources, policy):
+    """session.create, retrying once as ``cli`` if the owner refuses this source."""
+    try:
+        return await client.rpc("session.create", request_id=uuid.uuid4().hex, source=source, **policy)
+    except GatewayRPCError as exc:
+        if _source_refused(exc) and source != "cli" and "cli" in sources:
+            try:
+                return await client.rpc(
+                    "session.create", request_id=uuid.uuid4().hex, source="cli", **policy
+                )
+            except GatewayRPCError as retry_exc:
+                raise GatewayClientError(
+                    f"Gateway refused source {source!r} (retry 'cli' also refused): {retry_exc}"
+                ) from retry_exc
+        if _source_refused(exc):
+            raise GatewayClientError(f"Gateway refused source {source!r}: {exc}") from exc
+        raise
 
 
 def shell_client_env() -> dict:
@@ -219,7 +244,7 @@ async def run_gateway_chat(args, emitter=None):
             missing = sorted(set(policy) - set(parameters))
             if missing:
                 raise GatewayClientError("Gateway does not support creation options: " + ", ".join(missing))
-            snapshot = await client.rpc("session.create", request_id=uuid.uuid4().hex, source=source, **policy)
+            snapshot = await _session_create(client, source, sources, policy)
             if (warning := (snapshot.get("info") or {}).get("config_warning")) and not isinstance(oneshot_prompt, str):
                 print(f"Warning: {warning}", file=sys.stderr)
         if not isinstance(oneshot_prompt, str):  # main's -z writes nothing to stderr on success

@@ -9,6 +9,7 @@ import logging
 from pathlib import Path
 
 from hermes_state_runtime import RuntimeStoreError
+from gateway.session_create_sources import SURFACES
 
 logger = logging.getLogger(__name__)
 
@@ -79,10 +80,8 @@ SELECTION_KEYS = ('default', 'provider', 'base_url', 'api_mode', 'selection_prof
 BYPASS_FIELDS = ('safe_mode', 'ignore_user_config')
 _ACTIVE_POLICY: ContextVar = ContextVar('local_session_policy', default=None)
 _TURN_PROFILE: ContextVar = ContextVar('follow_profile_read', default=None)  # (policy, live) for a turn
-# Creation label -> agent surface. ``tool`` (third-party integrations, ``hermes chat --source tool``) and
-# ``oneshot`` (finite ``chat -q`` / ``-z`` runs) run as the CLI but keep their own stored label, so human
-# pickers hide them (INTERNAL_LISTING_SOURCES).
-SURFACES = {'cli': 'cli', 'tui': 'tui', 'gui': 'desktop', 'acp': 'acp', 'tool': 'cli', 'oneshot': 'cli'}
+# SURFACES (creation label -> agent surface) lives in gateway.session_create_sources so
+# runtime.describe and the canonical session.create validator cannot drift.
 # ``tool`` and ``oneshot`` stay stored under their own labels so pickers can hide them.
 # Every other creation label is rewritten to ``source='local'`` on peer refresh.
 _KEEP_STORED_LABEL = frozenset({'tool', 'oneshot'})

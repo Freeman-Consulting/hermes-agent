@@ -194,6 +194,17 @@ def test_the_cli_copy_names_the_field_a_user_reads():
     assert 'invalid_params' in message and 'toolsets' in message
 
 
+def test_the_cli_copy_names_canonical_fields_list():
+    """session.create contract refusals send ``fields: ['source']``, not ``field``."""
+    from hermes_cli.cli_chat_error_copy import agent_init_failure_message
+    from hermes_cli.gateway_client import GatewayRPCError
+
+    exc = GatewayRPCError('invalid_params', 4001, {
+        'reason': 'invalid_params', 'fields': ['source']})
+    message = agent_init_failure_message(exc)
+    assert 'invalid_params' in message and 'source' in message
+
+
 def test_a_refusal_without_a_named_field_reads_exactly_as_before():
     """Refusals raised elsewhere keep their copy: no empty parentheses on the panel."""
     from hermes_cli.cli_chat_error_copy import agent_init_failure_message

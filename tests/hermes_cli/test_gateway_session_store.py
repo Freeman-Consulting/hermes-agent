@@ -89,6 +89,65 @@ def test_a_finite_run_creates_mains_oneshot_session_so_bare_c_finds_it(store, mo
     assert client.calls[-1][1]["source"] == "cli"
 
 
+ADVERTISED_SOURCES = ["acp", "cli", "gui", "oneshot", "tool", "tui"]
+
+
+def _advertise_create_sources(client):
+    original = client.rpc
+
+    async def rpc(method, *, _timeout=None, **params):
+        if method == "runtime.describe":
+            client.calls.append((method, params))
+            return {"session_create": {"sources": list(ADVERTISED_SOURCES), "parameters": []}}
+        return await original(method, _timeout=_timeout, **params)
+
+    client.rpc = rpc
+
+
+def test_inherited_kanban_finite_run_creates_oneshot_not_kanban(store, monkeypatch):
+    """Kanban/cron workers inherit HERMES_SESSION_SOURCE; session.create must send an advertised label."""
+    monkeypatch.setenv("HERMES_SESSION_SOURCE", "kanban")
+    monkeypatch.delenv("HERMES_SESSION_SOURCE_EXPLICIT", raising=False)
+    monkeypatch.setenv("HERMES_SINGLE_QUERY_SESSION", "1")
+    db, client = store
+    _advertise_create_sources(client)
+    GatewaySessionStore(db.connection).open_session(cli(), {})
+    create = next(p for m, p in client.calls if m == "session.create")
+    assert create["source"] == "oneshot"
+
+
+def test_inherited_cron_interactive_run_falls_back_to_cli(store, monkeypatch):
+    monkeypatch.setenv("HERMES_SESSION_SOURCE", "cron")
+    monkeypatch.delenv("HERMES_SESSION_SOURCE_EXPLICIT", raising=False)
+    monkeypatch.delenv("HERMES_SINGLE_QUERY_SESSION", raising=False)
+    db, client = store
+    _advertise_create_sources(client)
+    GatewaySessionStore(db.connection).open_session(cli(), {})
+    create = next(p for m, p in client.calls if m == "session.create")
+    assert create["source"] == "cli"
+
+
+def test_explicit_unadvertised_source_is_refused_before_create(store, monkeypatch):
+    monkeypatch.setenv("HERMES_SESSION_SOURCE", "kanban")
+    monkeypatch.setenv("HERMES_SESSION_SOURCE_EXPLICIT", "1")
+    db, client = store
+    _advertise_create_sources(client)
+    with pytest.raises(GatewayClientError, match="kanban"):
+        GatewaySessionStore(db.connection).open_session(cli(), {})
+    assert not any(m == "session.create" for m, _ in client.calls)
+
+
+def test_explicit_cli_source_is_not_rewritten(store, monkeypatch):
+    monkeypatch.setenv("HERMES_SESSION_SOURCE", "cli")
+    monkeypatch.setenv("HERMES_SESSION_SOURCE_EXPLICIT", "1")
+    monkeypatch.setenv("HERMES_SINGLE_QUERY_SESSION", "1")
+    db, client = store
+    _advertise_create_sources(client)
+    GatewaySessionStore(db.connection).open_session(cli(), {})
+    create = next(p for m, p in client.calls if m == "session.create")
+    assert create["source"] == "cli"
+
+
 def test_resume_attaches_and_unknown_target_is_left_to_mains_not_found_path(store):
     db, client = store
     assert db.open_session(cli("local-old", resumed=True)) == "local-old"

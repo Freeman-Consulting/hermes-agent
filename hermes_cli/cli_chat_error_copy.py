@@ -44,6 +44,10 @@ def refusal_text(error: BaseException | str) -> str:
     data = getattr(error, "data", None)
     data = data if isinstance(data, dict) else {}
     field, detail = str(data.get("field") or "").strip(), str(data.get("detail") or "").strip()
+    if not field:
+        fields = data.get("fields")
+        if isinstance(fields, list):
+            field = ", ".join(str(item) for item in fields if item)
     if not field and not detail:
         return str(error)
     return f"{error} ({field or 'unnamed field'}{': ' + detail if detail else ''})"

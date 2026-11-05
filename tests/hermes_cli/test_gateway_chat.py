@@ -128,6 +128,64 @@ async def test_finite_runs_create_oneshot_sessions_and_explicit_source_wins(monk
 
 
 @pytest.mark.asyncio
+async def test_create_retries_once_with_cli_when_source_is_refused(monkeypatch, tmp_path):
+    """If the owner refuses session.create on ``source``, retry once as ``cli`` and name it if that fails."""
+    from contextlib import asynccontextmanager
+    from hermes_cli import gateway_chat
+    from hermes_cli.gateway_chat_view import GatewayChatView
+    from hermes_cli.gateway_client import GatewayClientError, GatewayRPCError
+
+    created = []
+
+    class Peer:
+        async def rpc(self, method, **params):
+            if method == "runtime.describe":
+                return {"session_create": {"sources": ["cli", "oneshot"],
+                                           "parameters": ["cwd", "request_id", "source"]}}
+            if method == "session.create":
+                created.append(params["source"])
+                if params["source"] == "oneshot":
+                    raise GatewayRPCError("invalid_params", 4001,
+                                          {"reason": "invalid_params", "fields": ["source"]})
+                return {"stored_session_id": "stored"}
+            return {"stored_session_id": "stored"}
+
+    @asynccontextmanager
+    async def connected():
+        yield Peer()
+
+    async def rendered(self, query, *, oneshot):
+        return 0
+
+    monkeypatch.setattr(gateway_chat, "connect_gateway", connected)
+    monkeypatch.setattr(GatewayChatView, "run", rendered)
+    monkeypatch.chdir(tmp_path)
+    assert await gateway_chat.run_gateway_chat(argparse.Namespace(query="q", quiet=True)) == 0
+    assert created == ["oneshot", "cli"]
+
+    created.clear()
+
+    class AlwaysRefuse(Peer):
+        async def rpc(self, method, **params):
+            if method == "runtime.describe":
+                return await Peer.rpc(self, method, **params)
+            if method == "session.create":
+                created.append(params["source"])
+                raise GatewayRPCError("invalid_params", 4001,
+                                      {"reason": "invalid_params", "fields": ["source"]})
+            return {"stored_session_id": "stored"}
+
+    @asynccontextmanager
+    async def refusing():
+        yield AlwaysRefuse()
+
+    monkeypatch.setattr(gateway_chat, "connect_gateway", refusing)
+    with pytest.raises(GatewayClientError, match="source"):
+        await gateway_chat.run_gateway_chat(argparse.Namespace(query="q", quiet=True))
+    assert created == ["oneshot", "cli"]
+
+
+@pytest.mark.asyncio
 async def test_rpc_preserves_notifications_and_errors():
     import asyncio
     import json

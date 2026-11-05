@@ -70,6 +70,7 @@ class GatewaySessionStore:
         self.current: dict | None = None
         self._reader = None
         self._create_parameters = None
+        self._create_sources = None
 
     def __bool__(self):
         return not self.connection.final
@@ -166,7 +167,10 @@ class GatewaySessionStore:
         params = _creation_policy(launch or {})
         params["cwd"] = os.path.realpath(os.getenv("TERMINAL_CWD") or os.getcwd())
         # Main's row label: ``cli``, ``oneshot`` for a finite -q/-Q run, or an explicit --source.
-        params["source"] = session_source_for("cli")
+        # Inherited automation labels (kanban, cron, ...) are not session.create sources; clamp
+        # them to the owner's advertised set. Leave session_source_for itself unchanged so local
+        # rows keep their provenance.
+        params["source"] = self._wire_create_source(session_source_for("cli"))
         # Main's row stamp (run_agent._launch_cwd_for_session): this process's cwd (``-w`` never
         # chdirs, so the repo root), only for a CLI-family label on a local terminal backend.
         local = (os.getenv("TERMINAL_ENV") or "local").strip().lower() in ("", "local")
@@ -183,11 +187,31 @@ class GatewaySessionStore:
     def client_env(self):
         """This shell's ``client_env`` when the gateway takes it (one ``runtime.describe`` per store)."""
         from hermes_cli.gateway_chat import client_env_policy
+        parameters, _sources = self._create_contract()
+        return client_env_policy(parameters)
+
+    def _create_contract(self):
         if self._create_parameters is None:
             described = self.call("runtime.describe")
             contract = described.get("session_create") if isinstance(described, dict) else None
-            self._create_parameters = list((contract or {}).get("parameters") or [])
-        return client_env_policy(self._create_parameters)
+            contract = contract if isinstance(contract, dict) else {}
+            self._create_parameters = list(contract.get("parameters") or [])
+            self._create_sources = [s for s in (contract.get("sources") or []) if isinstance(s, str)]
+        return self._create_parameters, self._create_sources or []
+
+    def _wire_create_source(self, label):
+        """Clamp a process label to a source the owner advertised for session.create."""
+        advertised = self._create_contract()[1]
+        if not advertised or label in advertised:
+            return label
+        explicit = os.getenv("HERMES_SESSION_SOURCE_EXPLICIT", "") == "1"
+        if explicit:
+            raise GatewayClientError(f"Gateway does not support source {label!r}")
+        if os.getenv("HERMES_SINGLE_QUERY_SESSION", "") == "1" and "oneshot" in advertised:
+            return "oneshot"
+        if "cli" in advertised:
+            return "cli"
+        raise GatewayClientError(f"Gateway does not support source {label!r}")
 
     def branch(self, session_id, title=None):
         """``session.mutate branch``: the gateway forks the whole active transcript into a child it
