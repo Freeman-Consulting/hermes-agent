@@ -38,6 +38,23 @@ class FakeClient:
         return {"status": "ok", "detached": True}
 
 
+@pytest.fixture(autouse=True)
+def _unset_session_source_context():
+    """``get_session_env`` prefers a session ContextVar over ``os.environ`` even when the var was
+    cleared to ``""``, so a gateway test earlier in the suite that ran an in-process turn leaves
+    ``HERMES_SESSION_SOURCE`` shadowing the ``monkeypatch.setenv`` calls below (passes alone, fails
+    in ordered-suite runs). Unset the source-family vars for the test, then restore."""
+    from gateway.session_context import _UNSET, _VAR_MAP
+    tokens = {name: _VAR_MAP[name].set(_UNSET) for name in
+              ("HERMES_SESSION_SOURCE", "HERMES_SESSION_SOURCE_EXPLICIT",
+               "HERMES_SINGLE_QUERY_SESSION") if name in _VAR_MAP}
+    try:
+        yield
+    finally:
+        for name, token in tokens.items():
+            _VAR_MAP[name].reset(token)
+
+
 @pytest.fixture
 def store():
     client = FakeClient()
